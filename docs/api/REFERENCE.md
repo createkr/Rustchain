@@ -1,8 +1,9 @@
 # RustChain API Reference
 
-**Base URL:** `https://50.28.86.131` (Primary Node)  
+**Base URL:** `https://<rustchain-host>`  
 **Authentication:** Read-only endpoints are public. Writes require Ed25519 signatures or an Admin Key.  
-**Certificate Note:** The node uses a self-signed TLS certificate. Use the `-k` flag with `curl` or disable certificate verification in your client.
+**Endpoint discovery:** Host/IP can change; confirm the current public endpoint from maintainers before production integration.  
+**Certificate Note:** Prefer normal TLS verification in production. Use `-k` only as a temporary local-dev fallback when you knowingly target a self-signed endpoint.
 
 ---
 
@@ -67,7 +68,8 @@ List all miners currently participating in the network with their hardware detai
 Query the RTC balance for any valid miner ID.
 
 - **Endpoint:** `GET /wallet/balance?miner_id={NAME}`
-- **Example:** `curl -sk 'https://50.28.86.131/wallet/balance?miner_id=scott'`
+- **Example (strict TLS):** `curl --fail --silent --show-error 'https://<rustchain-host>/wallet/balance?miner_id=scott'`
+- **Dev fallback (self-signed only):** `curl -k --fail --silent --show-error 'https://<rustchain-host>/wallet/balance?miner_id=scott'`
 - **Response:**
   ```json
   {
@@ -98,9 +100,10 @@ Transfer RTC between wallets without requiring an admin key.
   }
   ```
 - **Process:** 
-  1. Construct JSON payload: `{"from": "...", "to": "...", "amount": 1.5, "nonce": "...", "memo": "..."}`
-  2. Sort keys and sign with Ed25519 private key.
-  3. Submit with hex-encoded signature.
+  1. Construct JSON payload using API field names: `from_address`, `to_address`, `amount_rtc`, `nonce`.
+  2. Build signing message as canonical JSON object with keys: `from`, `to`, `amount`, `nonce` (exactly as server verification expects).
+  3. Sign that message with the Ed25519 private key.
+  4. Submit request with `signature` and `public_key` as hex strings.
 
 ---
 
@@ -128,6 +131,7 @@ The RustChain API is strict about field names. Common errors include:
 - ❌ `miner_id` instead of **`miner`** (in miner object)
 - ❌ `current_slot` instead of **`slot`** (in epoch info)
 - ❌ `total_miners` instead of **`enrolled_miners`**
+- ❌ `from` / `to` in request body for `/wallet/transfer/signed` (must send **`from_address`** / **`to_address`**)
 
 ### Wallet Formats
 Wallets are **simple UTF-8 strings** (1-256 chars).  
@@ -136,7 +140,7 @@ Wallets are **simple UTF-8 strings** (1-256 chars).
 - ❌ `4TR...` (Solana addresses must be bridged via BoTTube)
 
 ### Certificate Errors
-If using `curl`, always include `-k` to bypass the self-signed certificate warning.
+Keep TLS verification enabled by default. If a temporary self-signed lab node is unavoidable, use `-k` only for that specific test endpoint and remove it once proper certs are available.
 
 ---
 *Last Updated: February 2026*
