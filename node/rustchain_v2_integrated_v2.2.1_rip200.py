@@ -3199,9 +3199,20 @@ def api_miner_dashboard(miner_id):
     try:
         with sqlite3.connect(DB_PATH) as c:
             c.row_factory = sqlite3.Row
-            # current balance from balances table (uRTC/i64 style fallback)
-            row = c.execute("SELECT balance_urtc FROM balances WHERE wallet = ?", (miner_id,)).fetchone()
-            bal_rtc = ((row['balance_urtc'] if row and row['balance_urtc'] is not None else 0) / 1_000_000.0)
+            # current balance from balances table with column-name fallback
+            bal_rtc = 0.0
+            try:
+                row = c.execute("SELECT balance_urtc AS amount_i64 FROM balances WHERE wallet = ?", (miner_id,)).fetchone()
+                if row and row['amount_i64'] is not None:
+                    bal_rtc = (row['amount_i64'] / 1_000_000.0)
+            except Exception:
+                row = None
+
+            if bal_rtc == 0.0:
+                # production schema fallback: amount_i64 + miner_id
+                row2 = c.execute("SELECT amount_i64 FROM balances WHERE miner_id = ?", (miner_id,)).fetchone()
+                if row2 and row2['amount_i64'] is not None:
+                    bal_rtc = (row2['amount_i64'] / 1_000_000.0)
 
             # total earned & reward history from confirmed pending_ledger credits
             total_row = c.execute("SELECT COALESCE(SUM(amount_i64),0) AS s, COUNT(*) AS cnt FROM pending_ledger WHERE to_miner = ? AND status = 'confirmed'", (miner_id,)).fetchone()
