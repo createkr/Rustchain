@@ -101,6 +101,7 @@ _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(_BASE_DIR, "..")) if os.path.basename(_BASE_DIR) == "node" else _BASE_DIR
 LIGHTCLIENT_DIR = os.path.join(REPO_ROOT, "web", "light-client")
 MUSEUM_DIR = os.path.join(REPO_ROOT, "web", "museum")
+HOF_DIR = os.path.join(REPO_ROOT, "web", "hall-of-fame")
 
 # Register Hall of Rust blueprint (tables initialized after DB_PATH is set)
 try:
@@ -1680,6 +1681,14 @@ def museum_assets(filename: str):
     from flask import send_from_directory as _send_from_directory
 
     return _send_from_directory(MUSEUM_DIR, filename)
+
+
+@app.route("/hall-of-fame/machine.html", methods=["GET"])
+def hall_of_fame_machine_page():
+    """Hall of Fame machine detail page."""
+    from flask import send_from_directory as _send_from_directory
+
+    return _send_from_directory(HOF_DIR, "machine.html")
 
 # ============= ATTESTATION ENDPOINTS =============
 
