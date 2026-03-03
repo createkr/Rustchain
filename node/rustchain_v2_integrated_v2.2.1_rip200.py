@@ -3,7 +3,7 @@
 RustChain v2 - Integrated Server
 Includes RIP-0005 (Epoch Rewards), RIP-0008 (Withdrawals), RIP-0009 (Finality)
 """
-import os, time, json, secrets, hashlib, hmac, sqlite3, base64, struct, uuid, glob, logging, sys, binascii, math, re, statistics
+import os, time, json, secrets, hashlib, hmac, sqlite3, base64, struct, uuid, glob, logging, sys, binascii, math
 import ipaddress
 from urllib.parse import urlparse
 from flask import Flask, request, jsonify, g, send_from_directory, send_file, abort
@@ -95,18 +95,6 @@ except ImportError as e:
     HW_PROOF_AVAILABLE = False
     print(f"[INIT] Hardware proof module not found: {e}")
 
-# Warthog dual-mining verification
-try:
-    from warthog_verification import (
-        verify_warthog_proof, record_warthog_proof,
-        get_warthog_bonus, init_warthog_tables
-    )
-    HAVE_WARTHOG = True
-    print("[INIT] [OK] Warthog dual-mining verification loaded")
-except ImportError as _e:
-    HAVE_WARTHOG = False
-    print(f"[INIT] Warthog verification not available: {_e}")
-
 app = Flask(__name__)
 # Supports running from repo `node/` dir or a flat deployment directory (e.g. /root/rustchain).
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -115,185 +103,6 @@ LIGHTCLIENT_DIR = os.path.join(REPO_ROOT, "web", "light-client")
 MUSEUM_DIR = os.path.join(REPO_ROOT, "web", "museum")
 HOF_DIR = os.path.join(REPO_ROOT, "web", "hall-of-fame")
 DASHBOARD_DIR = os.path.join(REPO_ROOT, "tools", "miner_dashboard")
-
-
-def _attest_mapping(value):
-    """Return a dict-like payload section or an empty mapping."""
-    return value if isinstance(value, dict) else {}
-
-
-_ATTEST_MINER_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
-
-
-def _attest_text(value):
-    """Accept only non-empty text values from untrusted attestation input."""
-    if isinstance(value, str):
-        value = value.strip()
-        if value:
-            return value
-    return None
-
-
-def _attest_valid_miner(value):
-    """Accept only bounded miner identifiers with a conservative character set."""
-    text = _attest_text(value)
-    if text and _ATTEST_MINER_RE.fullmatch(text):
-        return text
-    return None
-
-
-def _attest_field_error(code, message, status=400):
-    """Build a consistent error payload for malformed attestation inputs."""
-    return jsonify({
-        "ok": False,
-        "error": code.lower(),
-        "message": message,
-        "code": code,
-    }), status
-
-
-def _attest_is_valid_positive_int(value, max_value=4096):
-    """Validate positive integer-like input without silently coercing hostile shapes."""
-    if isinstance(value, bool):
-        return False
-    if isinstance(value, float):
-        if not math.isfinite(value) or not value.is_integer():
-            return False
-    try:
-        coerced = int(value)
-    except (TypeError, ValueError, OverflowError):
-        return False
-    return 1 <= coerced <= max_value
-
-
-def client_ip_from_request(req) -> str:
-    """Return trusted client IP from reverse proxy (X-Real-IP) or remote address."""
-    client_ip = req.headers.get("X-Real-IP") or req.remote_addr
-    if client_ip and "," in client_ip:
-        client_ip = client_ip.split(",")[0].strip()
-    return client_ip
-
-
-def _attest_positive_int(value, default=1):
-    """Coerce untrusted integer-like values to a safe positive integer."""
-    try:
-        coerced = int(value)
-    except (TypeError, ValueError):
-        return default
-    return coerced if coerced > 0 else default
-
-
-def _attest_string_list(value):
-    """Coerce a list-like field into a list of non-empty strings."""
-    if not isinstance(value, list):
-        return []
-    items = []
-    for item in value:
-        text = _attest_text(item)
-        if text:
-            items.append(text)
-    return items
-
-
-def _validate_attestation_payload_shape(data):
-    """Reject malformed attestation payload shapes before normalization."""
-    for field_name, code in (
-        ("device", "INVALID_DEVICE"),
-        ("signals", "INVALID_SIGNALS"),
-        ("report", "INVALID_REPORT"),
-        ("fingerprint", "INVALID_FINGERPRINT"),
-    ):
-        if field_name in data and data[field_name] is not None and not isinstance(data[field_name], dict):
-            return _attest_field_error(code, f"Field '{field_name}' must be a JSON object")
-
-    for field_name in ("miner", "miner_id"):
-        if field_name in data and data[field_name] is not None and not isinstance(data[field_name], str):
-            return _attest_field_error("INVALID_MINER", f"Field '{field_name}' must be a non-empty string")
-
-    miner = _attest_valid_miner(data.get("miner")) or _attest_valid_miner(data.get("miner_id"))
-    if not miner and not (_attest_text(data.get("miner")) or _attest_text(data.get("miner_id"))):
-        return _attest_field_error(
-            "MISSING_MINER",
-            "Field 'miner' or 'miner_id' must be a non-empty identifier using only letters, numbers, '.', '_', ':' or '-'",
-        )
-    if not miner:
-        return _attest_field_error(
-            "INVALID_MINER",
-            "Field 'miner' or 'miner_id' must use only letters, numbers, '.', '_', ':' or '-' and be at most 128 characters",
-        )
-
-    device = data.get("device")
-    if isinstance(device, dict):
-        if "cores" in device and not _attest_is_valid_positive_int(device.get("cores")):
-            return _attest_field_error("INVALID_DEVICE_CORES", "Field 'device.cores' must be a positive integer between 1 and 4096", status=422)
-        for field_name in ("device_family", "family", "device_arch", "arch", "device_model", "model", "cpu", "serial_number", "serial"):
-            if field_name in device and device[field_name] is not None and not isinstance(device[field_name], str):
-                return _attest_field_error("INVALID_DEVICE", f"Field 'device.{field_name}' must be a string")
-
-    signals = data.get("signals")
-    if isinstance(signals, dict):
-        if "macs" in signals:
-            macs = signals.get("macs")
-            if not isinstance(macs, list) or any(_attest_text(mac) is None for mac in macs):
-                return _attest_field_error("INVALID_SIGNALS_MACS", "Field 'signals.macs' must be a list of non-empty strings")
-        for field_name in ("hostname", "serial"):
-            if field_name in signals and signals[field_name] is not None and not isinstance(signals[field_name], str):
-                return _attest_field_error("INVALID_SIGNALS", f"Field 'signals.{field_name}' must be a string")
-
-    report = data.get("report")
-    if isinstance(report, dict):
-        for field_name in ("nonce", "commitment"):
-            if field_name in report and report[field_name] is not None and not isinstance(report[field_name], str):
-                return _attest_field_error("INVALID_REPORT", f"Field 'report.{field_name}' must be a string")
-
-    fingerprint = data.get("fingerprint")
-    if isinstance(fingerprint, dict) and "checks" in fingerprint and not isinstance(fingerprint.get("checks"), dict):
-        return _attest_field_error("INVALID_FINGERPRINT_CHECKS", "Field 'fingerprint.checks' must be a JSON object")
-
-    return None
-
-
-def _normalize_attestation_device(device):
-    """Shallow-normalize device metadata so malformed JSON shapes fail closed."""
-    raw = _attest_mapping(device)
-    normalized = {"cores": _attest_positive_int(raw.get("cores"), default=1)}
-    for field in (
-        "device_family",
-        "family",
-        "device_arch",
-        "arch",
-        "device_model",
-        "model",
-        "cpu",
-        "serial_number",
-        "serial",
-    ):
-        text = _attest_text(raw.get(field))
-        if text is not None:
-            normalized[field] = text
-    return normalized
-
-
-def _normalize_attestation_signals(signals):
-    """Shallow-normalize signal metadata used by attestation validation."""
-    raw = _attest_mapping(signals)
-    normalized = {"macs": _attest_string_list(raw.get("macs"))}
-    for field in ("hostname", "serial"):
-        text = _attest_text(raw.get(field))
-        if text is not None:
-            normalized[field] = text
-    return normalized
-
-
-def _normalize_attestation_report(report):
-    """Normalize report metadata used by challenge/ticket handling."""
-    raw = _attest_mapping(report)
-    normalized = {}
-    for field in ("nonce", "commitment"):
-        text = _attest_text(raw.get(field))
-        if text is not None:
-            normalized[field] = text
-    return normalized
 
 # Register Hall of Rust blueprint (tables initialized after DB_PATH is set)
 try:
@@ -318,10 +127,7 @@ def _start_timer():
 
 def get_client_ip():
     """Trust reverse-proxy X-Real-IP, not client X-Forwarded-For."""
-    client_ip = request.headers.get("X-Real-IP") or request.remote_addr
-    if client_ip and "," in client_ip:
-        client_ip = client_ip.split(",")[0].strip()
-    return client_ip
+    return request.headers.get("X-Real-IP") or request.remote_addr
 
 @app.after_request
 def _after(resp):
@@ -763,11 +569,6 @@ MIN_WITHDRAWAL = 0.1  # RTC
 WITHDRAWAL_FEE = 0.01  # RTC
 MAX_DAILY_WITHDRAWAL = 1000.0  # RTC
 
-GOVERNANCE_ACTIVE_SECONDS = 7 * 24 * 60 * 60
-GOVERNANCE_MIN_PROPOSER_BALANCE_RTC = 10.0
-GOVERNANCE_ACTIVE_MINER_WINDOW_SECONDS = 3600
-
-
 # Prometheus metrics
 withdrawal_requests = Counter('rustchain_withdrawal_requests', 'Total withdrawal requests')
 withdrawal_completed = Counter('rustchain_withdrawal_completed', 'Completed withdrawals')
@@ -819,7 +620,6 @@ def init_db():
         c.execute("CREATE TABLE IF NOT EXISTS epoch_state (epoch INTEGER PRIMARY KEY, accepted_blocks INTEGER DEFAULT 0, finalized INTEGER DEFAULT 0)")
         c.execute("CREATE TABLE IF NOT EXISTS epoch_enroll (epoch INTEGER, miner_pk TEXT, weight REAL, PRIMARY KEY (epoch, miner_pk))")
         c.execute("CREATE TABLE IF NOT EXISTS balances (miner_pk TEXT PRIMARY KEY, balance_rtc REAL DEFAULT 0)")
-        ensure_fingerprint_history_table(c)
 
         # Pending transfers (2-phase commit)
         # NOTE: Production DBs may already have a different balances schema; this table is additive.
@@ -916,9 +716,6 @@ def init_db():
             )
         """)
 
-        # Governance proposal and voting tables
-        _ensure_governance_tables(c)
-
         # Governance tables (RIP-0142)
         c.execute("""
             CREATE TABLE IF NOT EXISTS gov_rotation_proposals(
@@ -994,11 +791,6 @@ def init_db():
         c.execute("CREATE TABLE IF NOT EXISTS beacon_envelopes (id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id TEXT NOT NULL, kind TEXT NOT NULL, nonce TEXT UNIQUE NOT NULL, sig TEXT NOT NULL, pubkey TEXT NOT NULL, payload_hash TEXT NOT NULL, anchored INTEGER DEFAULT 0, created_at INTEGER NOT NULL)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_beacon_anchored ON beacon_envelopes(anchored)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_beacon_agent ON beacon_envelopes(agent_id, created_at)")
-
-        # Warthog dual-mining tables
-        if HAVE_WARTHOG:
-            init_warthog_tables(c)
-
         c.commit()
 
 # Hardware multipliers
@@ -1012,102 +804,6 @@ HARDWARE_WEIGHTS = {
                 "genesis_68000": 2.5, "gameboy_z80": 2.6, "ps1_mips": 2.8,
                 "saturn_sh2": 2.6, "gba_arm7": 2.3, "default": 2.5}
 }
-
-POWERPC_ARCHES = {"g3", "g4", "g5", "power8", "power9", "powerpc", "power macintosh"}
-X86_CPU_BRANDS = {"intel", "xeon", "core", "celeron", "pentium", "amd", "ryzen", "epyc", "athlon", "threadripper"}
-ARM_CPU_BRANDS = {"arm", "aarch64", "cortex", "neoverse", "apple m1", "apple m2", "apple m3"}
-
-
-def _fingerprint_checks_map(fingerprint: dict) -> dict:
-    if not isinstance(fingerprint, dict):
-        return {}
-    checks = fingerprint.get("checks", {})
-    return checks if isinstance(checks, dict) else {}
-
-
-def _fingerprint_check_data(fingerprint: dict, check_name: str) -> dict:
-    item = _fingerprint_checks_map(fingerprint).get(check_name, {})
-    if isinstance(item, dict):
-        data = item.get("data", {})
-        return data if isinstance(data, dict) else {}
-    return {}
-
-
-def _claimed_family_and_arch(device: dict) -> tuple:
-    family = str(device.get("device_family") or device.get("family") or "x86")
-    arch = str(device.get("device_arch") or device.get("arch") or "default")
-    return family, arch
-
-
-def _cpu_brand_string(device: dict) -> str:
-    return " ".join(
-        str(device.get(key) or "").strip()
-        for key in ("cpu", "device_model", "model", "brand")
-        if str(device.get(key) or "").strip()
-    ).lower()
-
-
-def _has_any_token(text: str, tokens: set) -> bool:
-    return any(token in text for token in tokens)
-
-
-def _claims_powerpc(device: dict) -> bool:
-    family, arch = _claimed_family_and_arch(device)
-    family_lower = family.lower()
-    arch_lower = arch.lower()
-    return "powerpc" in family_lower or "ppc" in family_lower or arch_lower in POWERPC_ARCHES
-
-
-def _powerpc_cpu_brand_matches(device: dict) -> bool:
-    cpu_brand = _cpu_brand_string(device)
-    if not cpu_brand:
-        return False
-    if _has_any_token(cpu_brand, X86_CPU_BRANDS | ARM_CPU_BRANDS):
-        return False
-    return any(token in cpu_brand for token in ("powerpc", "ppc", "ibm power", "g3", "g4", "g5", "7447", "7450", "7455", "7448", "970", "power8", "power9"))
-
-
-def _has_powerpc_simd_evidence(fingerprint: dict) -> bool:
-    simd_data = _fingerprint_check_data(fingerprint, "simd_identity")
-    x86_features = simd_data.get("x86_features", [])
-    if not isinstance(x86_features, list):
-        x86_features = []
-    has_x86 = bool(x86_features) or bool(simd_data.get("has_sse")) or bool(simd_data.get("has_avx"))
-    has_ppc = bool(
-        simd_data.get("altivec")
-        or simd_data.get("vsx")
-        or simd_data.get("vec_perm")
-        or simd_data.get("has_altivec")
-    )
-    return has_ppc and not has_x86
-
-
-def _has_powerpc_cache_profile(fingerprint: dict) -> bool:
-    cache_data = _fingerprint_check_data(fingerprint, "cache_timing")
-    arch_hint = str(cache_data.get("arch") or cache_data.get("architecture") or "").lower()
-    if "powerpc" in arch_hint or "ppc" in arch_hint:
-        return True
-    l2_l1_ratio = float(cache_data.get("l2_l1_ratio", 0.0) or 0.0)
-    l3_l2_ratio = float(cache_data.get("l3_l2_ratio", 0.0) or 0.0)
-    hierarchy_ratio = float(cache_data.get("hierarchy_ratio", 0.0) or 0.0)
-    return (l2_l1_ratio >= 1.05 and l3_l2_ratio >= 1.05) or hierarchy_ratio >= 1.2
-
-
-def derive_verified_device(device: dict, fingerprint: dict, fingerprint_passed: bool) -> dict:
-    family, arch = _claimed_family_and_arch(device)
-    if not _claims_powerpc(device):
-        return {"device_family": family, "device_arch": arch}
-
-    cpu_brand = _cpu_brand_string(device)
-    simd_data = _fingerprint_check_data(fingerprint, "simd_identity")
-    if fingerprint_passed and _powerpc_cpu_brand_matches(device) and _has_powerpc_simd_evidence(fingerprint) and _has_powerpc_cache_profile(fingerprint):
-        return {"device_family": "PowerPC", "device_arch": arch.upper()}
-
-    if _has_any_token(cpu_brand, ARM_CPU_BRANDS) or bool(simd_data.get("has_neon")):
-        return {"device_family": "ARM", "device_arch": "default"}
-    if _has_any_token(cpu_brand, X86_CPU_BRANDS) or bool(simd_data.get("has_sse")) or bool(simd_data.get("has_avx")):
-        return {"device_family": "x86_64", "device_arch": "default"}
-    return {"device_family": "x86", "device_arch": "default"}
 
 # RIP-0146b: Enrollment enforcement config
 ENROLL_REQUIRE_TICKET = os.getenv("ENROLL_REQUIRE_TICKET", "1") == "1"
@@ -1223,13 +919,11 @@ def auto_induct_to_hall(miner: str, device: dict):
 
 def record_attestation_success(miner: str, device: dict, fingerprint_passed: bool = False, source_ip: str = None, signals: dict = None, fingerprint: dict = None):
     now = int(time.time())
-    verified_device = derive_verified_device(device or {}, fingerprint if isinstance(fingerprint, dict) else {}, fingerprint_passed)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
             INSERT OR REPLACE INTO miner_attest_recent (miner, ts_ok, device_family, device_arch, entropy_score, fingerprint_passed, source_ip)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (miner, now, verified_device["device_family"], verified_device["device_arch"], 0.0, 1 if fingerprint_passed else 0, source_ip))
-        _ = append_fingerprint_snapshot(conn, miner, fingerprint if isinstance(fingerprint, dict) else {}, now)
+        """, (miner, now, device.get("device_family", device.get("family", "unknown")), device.get("device_arch", device.get("arch", "unknown")), 0.0, 1 if fingerprint_passed else 0, source_ip))
         conn.commit()
 
         # RIP-201: Record fleet immune system signals
@@ -1240,156 +934,7 @@ def record_attestation_success(miner: str, device: dict, fingerprint_passed: boo
             except Exception as _fe:
                 print(f"[RIP-201] Fleet signal recording warning: {_fe}")
     # Auto-induct to Hall of Rust
-    auto_induct_to_hall(miner, verified_device)
-
-
-TEMPORAL_HISTORY_LIMIT = 10
-TEMPORAL_DRIFT_BANDS = {
-    "clock_drift_cv": (0.0005, 0.35),
-    "thermal_variance": (0.05, 25.0),
-    "jitter_cv": (0.0001, 0.50),
-    "cache_hierarchy_ratio": (1.10, 20.0),
-}
-
-
-def ensure_fingerprint_history_table(conn):
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS miner_fingerprint_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            miner TEXT NOT NULL,
-            ts INTEGER NOT NULL,
-            profile_json TEXT NOT NULL
-        )
-        """
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_mfh_miner_ts ON miner_fingerprint_history(miner, ts DESC)")
-
-
-def extract_temporal_profile(fingerprint: dict) -> dict:
-    checks = (fingerprint or {}).get("checks", {}) if isinstance(fingerprint, dict) else {}
-
-    def _check_data(name):
-        item = checks.get(name, {})
-        if isinstance(item, dict):
-            data = item.get("data", {})
-            return data if isinstance(data, dict) else {}
-        return {}
-
-    clock = _check_data("clock_drift")
-    thermal = _check_data("thermal_entropy") or _check_data("thermal_drift")
-    jitter = _check_data("instruction_jitter")
-    cache = _check_data("cache_timing")
-
-    return {
-        "clock_drift_cv": float(clock.get("cv", 0.0) or 0.0),
-        "thermal_variance": float(thermal.get("variance", 0.0) or 0.0),
-        "jitter_cv": float(jitter.get("cv", 0.0) or jitter.get("stddev_ns", 0.0) or 0.0),
-        "cache_hierarchy_ratio": float(cache.get("hierarchy_ratio", 0.0) or 0.0),
-    }
-
-
-def append_fingerprint_snapshot(conn, miner: str, fingerprint: dict, now: int) -> list:
-    ensure_fingerprint_history_table(conn)
-    profile = extract_temporal_profile(fingerprint)
-    conn.execute(
-        "INSERT INTO miner_fingerprint_history (miner, ts, profile_json) VALUES (?, ?, ?)",
-        (miner, now, json.dumps(profile, separators=(",", ":"))),
-    )
-    conn.execute(
-        """
-        DELETE FROM miner_fingerprint_history
-        WHERE miner = ? AND id NOT IN (
-            SELECT id FROM miner_fingerprint_history
-            WHERE miner = ?
-            ORDER BY ts DESC, id DESC
-            LIMIT ?
-        )
-        """,
-        (miner, miner, TEMPORAL_HISTORY_LIMIT),
-    )
-    rows = conn.execute(
-        "SELECT ts, profile_json FROM miner_fingerprint_history WHERE miner = ? ORDER BY ts ASC, id ASC",
-        (miner,),
-    ).fetchall()
-    seq = []
-    for ts, profile_json in rows:
-        try:
-            seq.append({"ts": int(ts), "profile": json.loads(profile_json or "{}")})
-        except Exception:
-            continue
-    return seq
-
-
-def fetch_miner_fingerprint_sequence(conn, miner: str) -> list:
-    ensure_fingerprint_history_table(conn)
-    rows = conn.execute(
-        "SELECT ts, profile_json FROM miner_fingerprint_history WHERE miner = ? ORDER BY ts ASC, id ASC",
-        (miner,),
-    ).fetchall()
-    out = []
-    for ts, profile_json in rows:
-        try:
-            out.append({"ts": int(ts), "profile": json.loads(profile_json or "{}")})
-        except Exception:
-            continue
-    return out
-
-
-def validate_temporal_consistency(sequence: list, current_profile: dict = None) -> dict:
-    samples = list(sequence or [])
-    if current_profile is not None:
-        samples.append({"ts": int(time.time()), "profile": current_profile})
-    if len(samples) < 3:
-        return {
-            "score": 1.0,
-            "review_flag": False,
-            "reason": "insufficient_history",
-            "flags": [],
-            "check_scores": {},
-        }
-
-    flags = []
-    check_scores = {}
-    for metric, (low, high) in TEMPORAL_DRIFT_BANDS.items():
-        values = []
-        for s in samples:
-            p = s.get("profile", {}) if isinstance(s, dict) else {}
-            if isinstance(p, dict):
-                v = float(p.get(metric, 0.0) or 0.0)
-                if v > 0:
-                    values.append(v)
-
-        if len(values) < 3:
-            check_scores[metric] = 1.0
-            continue
-
-        avg = sum(values) / len(values)
-        spread = statistics.pstdev(values)
-        rel_var = spread / max(abs(avg), 1e-9)
-
-        score = 1.0
-        if rel_var < 0.01:
-            flags.append(f"frozen_profile:{metric}")
-            score = min(score, 0.2)
-        if rel_var > 0.8:
-            flags.append(f"noisy_profile:{metric}")
-            score = min(score, 0.3)
-        if avg < low or avg > high:
-            flags.append(f"drift_out_of_band:{metric}")
-            score = min(score, 0.4)
-
-        check_scores[metric] = score
-
-    score = sum(check_scores.values()) / max(len(check_scores), 1)
-    review_flag = any(f.startswith("frozen_profile") or f.startswith("noisy_profile") or f.startswith("drift_out_of_band") for f in flags)
-    return {
-        "score": round(score, 4),
-        "review_flag": review_flag,
-        "reason": "temporal_review_required" if review_flag else "temporal_consistent",
-        "flags": flags,
-        "check_scores": check_scores,
-    }
+    auto_induct_to_hall(miner, device)
 # =============================================================================
 # FINGERPRINT VALIDATION (RIP-PoA Anti-Emulation)
 # =============================================================================
@@ -1440,11 +985,9 @@ def validate_fingerprint_data(fingerprint: dict, claimed_device: dict = None) ->
     if not fingerprint:
         # FIX #305: Missing fingerprint data is a validation failure
         return False, "no_fingerprint_data"
-    if not isinstance(fingerprint, dict):
-        return False, "fingerprint_not_dict"
 
-    checks = _fingerprint_checks_map(fingerprint)
-    claimed_device = claimed_device if isinstance(claimed_device, dict) else {}
+    checks = fingerprint.get("checks", {})
+    claimed_device = claimed_device or {}
 
     # FIX #305: Reject empty fingerprint payloads (e.g. fingerprint={} or checks={})
     if not checks:
@@ -1576,18 +1119,23 @@ def validate_fingerprint_data(fingerprint: dict, claimed_device: dict = None) ->
                    claimed_device.get("arch", "modern")).lower()
 
     # If claiming PowerPC, check for x86-specific signals in fingerprint
-    if claimed_arch in POWERPC_ARCHES:
-        if not _powerpc_cpu_brand_matches(claimed_device):
-            print(f"[FINGERPRINT] REJECT: claims {claimed_arch} but CPU brand does not match PowerPC")
-            return False, f"cpu_brand_mismatch:claims_{claimed_arch}"
+    if claimed_arch in {"g4", "g5", "g3", "powerpc", "power macintosh"}:
+        simd_check = checks.get("simd_identity")
+        if isinstance(simd_check, dict):
+            simd_data = simd_check.get("data", {})
+            if not isinstance(simd_data, dict):
+                simd_data = {}
+            # x86 SIMD features should NOT be present on PowerPC
+            x86_features = simd_data.get("x86_features", [])
+            if x86_features:
+                print(f"[FINGERPRINT] REJECT: claims {claimed_arch} but has x86 SIMD: {x86_features}")
+                return False, f"arch_mismatch:claims_{claimed_arch}_has_x86_simd"
 
-        if not _has_powerpc_simd_evidence(fingerprint):
-            print(f"[FINGERPRINT] REJECT: claims {claimed_arch} but lacks PowerPC SIMD evidence")
-            return False, f"missing_powerpc_simd:{claimed_arch}"
-
-        if not _has_powerpc_cache_profile(fingerprint):
-            print(f"[FINGERPRINT] REJECT: claims {claimed_arch} but lacks PowerPC cache profile")
-            return False, f"missing_powerpc_cache_profile:{claimed_arch}"
+            # PowerPC should have altivec/vsx indicators
+            has_ppc_simd = simd_data.get("altivec") or simd_data.get("vsx") or simd_data.get("has_altivec")
+            # Don't reject if no SIMD data at all (old miners) but log it
+            if x86_features and not has_ppc_simd:
+                print(f"[FINGERPRINT] SUSPICIOUS: claims {claimed_arch}, x86 SIMD present, no AltiVec")
 
     # ── PHASE 3: ROM fingerprint (retro platforms) ──
     rom_passed, rom_data = get_check_status(checks.get("rom_fingerprint"))
@@ -1892,594 +1440,224 @@ def openapi_spec():
 
 @app.route('/explorer', methods=['GET'])
 def explorer():
-    """Real-time block explorer dashboard (Tier 1 + Tier 2 views)."""
+    """Lightweight blockchain explorer interface"""
     html = """<!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>RustChain Explorer Dashboard</title>
-  <style>
-    :root {
-      --bg: #1a1a2e;
-      --panel: #16213e;
-      --panel-soft: #21325a;
-      --accent: #f39c12;
-      --text: #e8edf7;
-      --muted: #99a7c2;
-      --ok: #2ecc71;
-      --warn: #e67e22;
-      --border: #2f4478;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: "Segoe UI", Arial, sans-serif;
-      background: radial-gradient(circle at top right, #243b66 0, var(--bg) 45%);
-      color: var(--text);
-      min-height: 100vh;
-    }
-    .page {
-      max-width: 1280px;
-      margin: 0 auto;
-      padding: 24px 16px 40px;
-    }
-    .hero {
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: space-between;
-      gap: 12px;
-      margin-bottom: 18px;
-    }
-    .title-wrap h1 {
-      margin: 0;
-      font-size: 32px;
-      letter-spacing: 0.3px;
-    }
-    .title-wrap p {
-      margin: 8px 0 0;
-      color: var(--muted);
-    }
-    .links a {
-      color: var(--accent);
-      text-decoration: none;
-      font-weight: 600;
-      margin-left: 16px;
-    }
-    .card-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-      gap: 10px;
-      margin-bottom: 16px;
-    }
-    .card {
-      background: linear-gradient(165deg, var(--panel-soft), var(--panel));
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 14px;
-    }
-    .card .label {
-      font-size: 12px;
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: 0.8px;
-    }
-    .card .value {
-      margin-top: 6px;
-      font-size: 28px;
-      font-weight: 700;
-      color: var(--accent);
-      font-family: "Consolas", "Courier New", monospace;
-    }
-    .toolbar {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 12px;
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      align-items: center;
-      margin-bottom: 12px;
-    }
-    .toolbar button, .toolbar select {
-      background: #20345f;
-      color: var(--text);
-      border: 1px solid #35508a;
-      border-radius: 8px;
-      padding: 8px 10px;
-      cursor: pointer;
-    }
-    .toolbar button:hover { background: #2a4478; }
-    .toolbar .muted {
-      margin-left: auto;
-      color: var(--muted);
-      font-size: 13px;
-    }
-    .table-wrap {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      overflow: hidden;
-      overflow-x: auto;
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      min-width: 980px;
-    }
-    th, td {
-      padding: 10px 10px;
-      text-align: left;
-      border-bottom: 1px solid #243a67;
-      font-size: 14px;
-    }
-    th button {
-      color: var(--text);
-      background: transparent;
-      border: 0;
-      cursor: pointer;
-      font-weight: 700;
-      padding: 0;
-    }
-    .chip {
-      display: inline-flex;
-      align-items: center;
-      border-radius: 999px;
-      padding: 2px 8px;
-      font-size: 12px;
-      font-weight: 700;
-      border: 1px solid transparent;
-    }
-    .chip.ok { color: #b8ffd6; background: rgba(46, 204, 113, 0.15); border-color: rgba(46, 204, 113, 0.45); }
-    .chip.warn { color: #ffd6b0; background: rgba(230, 126, 34, 0.15); border-color: rgba(230, 126, 34, 0.45); }
-    .chip.arch { color: #ffe4af; background: rgba(243, 156, 18, 0.12); border-color: rgba(243, 156, 18, 0.35); }
-    .chip.mult { color: #d0f5ff; background: rgba(52, 152, 219, 0.15); border-color: rgba(52, 152, 219, 0.45); }
-    .mono { font-family: "Consolas", "Courier New", monospace; }
-    .empty {
-      padding: 18px;
-      color: var(--muted);
-      text-align: center;
-    }
-    .section-title {
-      margin: 18px 0 10px;
-      font-size: 20px;
-      letter-spacing: 0.3px;
-    }
-    .section-sub {
-      margin: 0 0 10px;
-      color: var(--muted);
-      font-size: 13px;
-    }
-    .agent-controls {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      align-items: center;
-      margin-bottom: 12px;
-    }
-    .agent-controls input, .agent-controls select, .agent-controls button {
-      background: #20345f;
-      color: var(--text);
-      border: 1px solid #35508a;
-      border-radius: 8px;
-      padding: 8px 10px;
-    }
-    .agent-controls button {
-      cursor: pointer;
-    }
-    .agent-controls button:hover {
-      background: #2a4478;
-    }
-    .lifecycle {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-      gap: 8px;
-      margin-bottom: 12px;
-    }
-    .lifecycle .node {
-      background: #1b2d52;
-      border: 1px solid #2a4578;
-      border-radius: 10px;
-      padding: 10px;
-    }
-    .lifecycle .node .k {
-      color: var(--muted);
-      font-size: 12px;
-      text-transform: uppercase;
-    }
-    .lifecycle .node .v {
-      margin-top: 4px;
-      color: var(--accent);
-      font-size: 24px;
-      font-weight: 700;
-      font-family: "Consolas", "Courier New", monospace;
-    }
-  </style>
+    <title>RustChain v2 Explorer</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .header { text-align: center; margin-bottom: 30px; }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 30px; }
+        .stat-card { background: #f8f9fa; padding: 15px; border-radius: 6px; border-left: 4px solid #007bff; }
+        .stat-value { font-size: 24px; font-weight: bold; color: #007bff; }
+        .stat-label { color: #666; font-size: 14px; }
+        .query-section { margin-bottom: 30px; }
+        .query-form { display: flex; gap: 10px; margin-bottom: 15px; align-items: center; }
+        .query-input { padding: 8px 12px; border: 1px solid #ddd; border-radius: 4px; flex: 1; }
+        .query-button { padding: 8px 16px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        .query-button:hover { background: #0056b3; }
+        .result-box { background: #f8f9fa; padding: 15px; border-radius: 6px; border: 1px solid #ddd; white-space: pre-wrap; font-family: monospace; }
+        .error { color: #dc3545; }
+        .success { color: #28a745; }
+        h2 { color: #333; border-bottom: 2px solid #007bff; padding-bottom: 5px; }
+        .refresh-btn { background: #28a745; }
+        .refresh-btn:hover { background: #1e7e34; }
+    </style>
 </head>
 <body>
-  <div class="page">
-    <div class="hero">
-      <div class="title-wrap">
-        <h1>RustChain Explorer</h1>
-        <p>Tier 1 + Tier 2 dashboard - miner telemetry + agent economy marketplace</p>
-      </div>
-      <div class="links">
-        <a href="/museum">Museum 2D</a>
-        <a href="/museum/3d">Museum 3D</a>
-      </div>
+    <div class="container">
+        <div class="header">
+            <h1>RustChain v2 Explorer</h1>
+            <p>Integrated Server with Epoch Rewards, Withdrawals, and Finality</p>
+            <p style="margin-top:10px;">
+              <a href="/museum" style="color:#007bff;text-decoration:none;font-weight:700;">Hardware Museum (2D)</a>
+              &nbsp;|&nbsp;
+              <a href="/museum/3d" style="color:#007bff;text-decoration:none;font-weight:700;">Hardware Museum (3D)</a>
+            </p>
+        </div>
+
+        <div class="stats-grid" id="stats">
+            <!-- Stats will be loaded here -->
+        </div>
+
+        <div class="query-section">
+            <h2>Balance Query</h2>
+            <div class="query-form">
+                <input type="text" id="minerPk" placeholder="Enter miner public key" class="query-input">
+                <button onclick="queryBalance()" class="query-button">Query Balance</button>
+            </div>
+            <div id="balanceResult" class="result-box" style="display: none;"></div>
+        </div>
+
+        <div class="query-section">
+            <h2>Withdrawal History</h2>
+            <div class="query-form">
+                <input type="text" id="withdrawalMinerPk" placeholder="Enter miner public key" class="query-input">
+                <input type="number" id="withdrawalLimit" placeholder="Limit (default: 50)" class="query-input" value="50">
+                <button onclick="queryWithdrawals()" class="query-button">Query History</button>
+            </div>
+            <div id="withdrawalResult" class="result-box" style="display: none;"></div>
+        </div>
+
+        <div class="query-section">
+            <h2>Epoch Information</h2>
+            <div class="query-form">
+                <button onclick="queryEpoch()" class="query-button">Get Current Epoch</button>
+                <button onclick="loadStats()" class="query-button refresh-btn">Refresh Stats</button>
+            </div>
+            <div id="epochResult" class="result-box" style="display: none;"></div>
+        </div>
     </div>
 
-    <div class="card-grid" id="topCards"></div>
-
-    <div class="toolbar">
-      <button id="refreshBtn">Refresh Now</button>
-      <label for="archFilter">Arch:</label>
-      <select id="archFilter">
-        <option value="all">All</option>
-      </select>
-      <label for="statusFilter">Status:</label>
-      <select id="statusFilter">
-        <option value="all">All</option>
-        <option value="online">Online</option>
-        <option value="offline">Offline</option>
-      </select>
-      <span class="muted" id="updatedAt">Last update: --</span>
-    </div>
-
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th><button data-sort="miner">Miner</button></th>
-            <th><button data-sort="architecture">Architecture</button></th>
-            <th><button data-sort="multiplier">Multiplier</button></th>
-            <th><button data-sort="status">Status</button></th>
-            <th><button data-sort="last_attest">Last Attestation</button></th>
-            <th>Hardware Type</th>
-          </tr>
-        </thead>
-        <tbody id="minerRows"></tbody>
-      </table>
-      <div id="empty" class="empty" style="display:none;">No miners matched the current filter.</div>
-    </div>
-
-    <h2 class="section-title">Agent Economy Marketplace</h2>
-    <p class="section-sub">Open jobs, lifecycle state, market stats, and reputation lookup.</p>
-
-    <div class="card-grid" id="agentCards"></div>
-    <div class="lifecycle" id="lifecycleGrid"></div>
-
-    <div class="agent-controls">
-      <button id="agentRefreshBtn">Refresh Agent Data</button>
-      <label for="jobCategoryFilter">Category:</label>
-      <select id="jobCategoryFilter"><option value="all">All</option></select>
-      <label for="repWallet">Reputation:</label>
-      <input id="repWallet" type="text" placeholder="wallet id (e.g. founder_community)">
-      <button id="repLookupBtn">Lookup</button>
-      <span class="muted" id="agentUpdatedAt">Agent update: --</span>
-    </div>
-
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Job ID</th>
-            <th>Category</th>
-            <th>Reward (RTC)</th>
-            <th>Status</th>
-            <th>Posted By</th>
-            <th>Updated</th>
-          </tr>
-        </thead>
-        <tbody id="jobRows"></tbody>
-      </table>
-      <div id="jobsEmpty" class="empty" style="display:none;">No agent jobs for the selected filter.</div>
-    </div>
-
-    <div class="table-wrap" style="margin-top:10px;">
-      <table>
-        <thead>
-          <tr>
-            <th>Wallet</th>
-            <th>Trust</th>
-            <th>Level</th>
-            <th>Jobs Posted</th>
-            <th>Completed</th>
-            <th>Total Paid (RTC)</th>
-            <th>Last Active</th>
-          </tr>
-        </thead>
-        <tbody id="repRows"></tbody>
-      </table>
-      <div id="repEmpty" class="empty">Lookup a wallet to view reputation.</div>
-    </div>
-  </div>
-
-  <script>
-    const state = {
-      miners: [],
-      sortBy: "multiplier",
-      sortDir: "desc",
-      archFilter: "all",
-      statusFilter: "all",
-      agentStats: null,
-      agentJobs: [],
-      jobCategoryFilter: "all",
-      reputation: null,
-    };
-
-    function nowSeconds() {
-      return Math.floor(Date.now() / 1000);
-    }
-
-    function statusFromAttest(ts) {
-      if (!ts) return "offline";
-      return (nowSeconds() - Number(ts)) <= 3600 ? "online" : "offline";
-    }
-
-    function architectureLabel(row) {
-      const family = String(row.device_family || "").trim();
-      const arch = String(row.device_arch || "").trim();
-      if (family && arch && family.toLowerCase() !== arch.toLowerCase()) return `${family}/${arch}`;
-      return arch || family || "unknown";
-    }
-
-    function formatTime(ts) {
-      if (!ts) return "-";
-      const date = new Date(Number(ts) * 1000);
-      return `${date.toLocaleString()} (${Math.max(0, nowSeconds() - Number(ts))}s ago)`;
-    }
-
-    async function fetchJson(path) {
-      const res = await fetch(path);
-      if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
-      return await res.json();
-    }
-
-    function applyFiltersAndSort() {
-      let rows = [...state.miners];
-      if (state.archFilter !== "all") {
-        rows = rows.filter((m) => architectureLabel(m).toLowerCase() === state.archFilter);
-      }
-      if (state.statusFilter !== "all") {
-        rows = rows.filter((m) => statusFromAttest(m.last_attest) === state.statusFilter);
-      }
-      const dir = state.sortDir === "asc" ? 1 : -1;
-      rows.sort((a, b) => {
-        let av;
-        let bv;
-        if (state.sortBy === "miner") {
-          av = String(a.miner || "").toLowerCase();
-          bv = String(b.miner || "").toLowerCase();
-        } else if (state.sortBy === "architecture") {
-          av = architectureLabel(a).toLowerCase();
-          bv = architectureLabel(b).toLowerCase();
-        } else if (state.sortBy === "multiplier") {
-          av = Number(a.antiquity_multiplier || 1);
-          bv = Number(b.antiquity_multiplier || 1);
-        } else if (state.sortBy === "last_attest") {
-          av = Number(a.last_attest || 0);
-          bv = Number(b.last_attest || 0);
-        } else {
-          av = statusFromAttest(a.last_attest);
-          bv = statusFromAttest(b.last_attest);
+    <script>
+        async function apiCall(endpoint) {
+            try {
+                const response = await fetch(endpoint);
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+                return await response.json();
+            } catch (error) {
+                throw error;
+            }
         }
-        if (av < bv) return -1 * dir;
-        if (av > bv) return 1 * dir;
-        return 0;
-      });
-      return rows;
-    }
 
-    function renderTopCards(health, epoch) {
-      const online = state.miners.filter((m) => statusFromAttest(m.last_attest) === "online").length;
-      const maxMultiplier = state.miners.reduce((acc, m) => Math.max(acc, Number(m.antiquity_multiplier || 1)), 1);
-      const cards = [
-        { label: "Node", value: health.ok ? "UP" : "DOWN" },
-        { label: "Epoch", value: epoch.epoch ?? "-" },
-        { label: "Slot", value: epoch.slot ?? "-" },
-        { label: "Active Miners", value: state.miners.length },
-        { label: "Online (<1h)", value: online },
-        { label: "Top Multiplier", value: `${maxMultiplier.toFixed(2)}x` },
-      ];
-      document.getElementById("topCards").innerHTML = cards.map((c) => `
-        <div class="card">
-          <div class="label">${c.label}</div>
-          <div class="value">${c.value}</div>
-        </div>
-      `).join("");
-    }
+        async function loadStats() {
+            try {
+                const stats = await apiCall('/api/stats');
+                const epoch = await apiCall('/epoch');
 
-    function renderMinerTable() {
-      const rows = applyFiltersAndSort();
-      const tbody = document.getElementById("minerRows");
-      tbody.innerHTML = rows.map((m) => {
-        const arch = architectureLabel(m);
-        const status = statusFromAttest(m.last_attest);
-        const mult = Number(m.antiquity_multiplier || 1);
-        return `
-          <tr>
-            <td class="mono">${m.miner || "-"}</td>
-            <td><span class="chip arch">${arch}</span></td>
-            <td><span class="chip mult">${mult.toFixed(2)}x</span></td>
-            <td><span class="chip ${status === "online" ? "ok" : "warn"}">${status}</span></td>
-            <td class="mono">${formatTime(m.last_attest)}</td>
-            <td>${m.hardware_type || "-"}</td>
-          </tr>
-        `;
-      }).join("");
-      document.getElementById("empty").style.display = rows.length ? "none" : "block";
-    }
+                const statsHtml = `
+                    <div class="stat-card">
+                        <div class="stat-value">${stats.version}</div>
+                        <div class="stat-label">Version</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value">${epoch.epoch}</div>
+                        <div class="stat-label">Current Epoch</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value">${epoch.slot}</div>
+                        <div class="stat-label">Current Slot</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value">${stats.total_miners}</div>
+                        <div class="stat-label">Total Miners</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value">${stats.total_balance.toFixed(4)} RTC</div>
+                        <div class="stat-label">Total Balance</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value">${epoch.epoch_pot} RTC</div>
+                        <div class="stat-label">Epoch Pot</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value">${epoch.enrolled_miners}</div>
+                        <div class="stat-label">Enrolled Miners</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value">${stats.pending_withdrawals}</div>
+                        <div class="stat-label">Pending Withdrawals</div>
+                    </div>
+                `;
 
-    function setupFilters() {
-      const archSet = new Set(state.miners.map((m) => architectureLabel(m).toLowerCase()));
-      const archFilter = document.getElementById("archFilter");
-      const current = archFilter.value;
-      archFilter.innerHTML = '<option value="all">All</option>' + [...archSet].sort().map((a) => `<option value="${a}">${a}</option>`).join("");
-      if ([...archSet, "all"].includes(current)) {
-        archFilter.value = current;
-      }
-    }
-
-    function renderAgentCards() {
-      const payload = state.agentStats && state.agentStats.stats ? state.agentStats.stats : {};
-      const cards = [
-        { label: "Open Jobs", value: payload.open_jobs ?? 0 },
-        { label: "Active Agents", value: payload.active_agents ?? 0 },
-        { label: "Total Jobs", value: payload.total_jobs ?? 0 },
-        { label: "Completed Jobs", value: payload.completed_jobs ?? 0 },
-        { label: "Volume (RTC)", value: Number(payload.total_rtc_volume || 0).toFixed(1) },
-        { label: "Fees (RTC)", value: Number(payload.total_fees_collected || 0).toFixed(1) },
-      ];
-      document.getElementById("agentCards").innerHTML = cards.map((c) => `
-        <div class="card">
-          <div class="label">${c.label}</div>
-          <div class="value">${c.value}</div>
-        </div>
-      `).join("");
-    }
-
-    function renderLifecycle() {
-      const counts = { posted: 0, claimed: 0, delivered: 0, completed: 0 };
-      for (const job of state.agentJobs) {
-        const status = String(job.status || "").toLowerCase();
-        if (counts[status] !== undefined) counts[status] += 1;
-        if (status === "open") counts.posted += 1;
-      }
-      document.getElementById("lifecycleGrid").innerHTML = [
-        ["Posted/Open", counts.posted],
-        ["Claimed", counts.claimed],
-        ["Delivered", counts.delivered],
-        ["Completed", counts.completed],
-      ].map(([k, v]) => `
-        <div class="node">
-          <div class="k">${k}</div>
-          <div class="v">${v}</div>
-        </div>
-      `).join("");
-    }
-
-    function setupJobCategoryFilter() {
-      const categories = new Set(state.agentJobs.map((j) => String(j.category || "other")));
-      const select = document.getElementById("jobCategoryFilter");
-      const current = select.value;
-      select.innerHTML = '<option value="all">All</option>' + [...categories].sort().map((c) => `<option value="${c}">${c}</option>`).join("");
-      if ([...categories, "all"].includes(current)) {
-        select.value = current;
-      }
-    }
-
-    function renderJobsTable() {
-      let rows = [...state.agentJobs];
-      if (state.jobCategoryFilter !== "all") {
-        rows = rows.filter((r) => String(r.category || "other") === state.jobCategoryFilter);
-      }
-      const tbody = document.getElementById("jobRows");
-      tbody.innerHTML = rows.map((job) => `
-        <tr>
-          <td class="mono">${job.job_id || "-"}</td>
-          <td>${job.category || "other"}</td>
-          <td>${Number(job.reward_rtc || 0).toFixed(2)}</td>
-          <td><span class="chip ${String(job.status || "").toLowerCase() === "completed" ? "ok" : "warn"}">${job.status || "unknown"}</span></td>
-          <td class="mono">${job.poster_wallet || "-"}</td>
-          <td class="mono">${job.updated_at || job.created_at || "-"}</td>
-        </tr>
-      `).join("");
-      document.getElementById("jobsEmpty").style.display = rows.length ? "none" : "block";
-    }
-
-    function renderReputation() {
-      const rep = state.reputation && state.reputation.reputation ? state.reputation.reputation : null;
-      const rows = document.getElementById("repRows");
-      if (!rep) {
-        rows.innerHTML = "";
-        document.getElementById("repEmpty").style.display = "block";
-        return;
-      }
-      document.getElementById("repEmpty").style.display = "none";
-      rows.innerHTML = `
-        <tr>
-          <td class="mono">${rep.wallet_id || "-"}</td>
-          <td>${rep.trust_score ?? "-"}</td>
-          <td>${rep.trust_level || "-"}</td>
-          <td>${rep.jobs_posted ?? 0}</td>
-          <td>${rep.jobs_completed_as_poster ?? 0}</td>
-          <td>${Number(rep.total_rtc_paid || 0).toFixed(2)}</td>
-          <td class="mono">${rep.last_active || "-"}</td>
-        </tr>
-      `;
-    }
-
-    async function lookupReputation() {
-      const wallet = document.getElementById("repWallet").value.trim();
-      if (!wallet) return;
-      try {
-        state.reputation = await fetchJson(`/agent/reputation/${encodeURIComponent(wallet)}`);
-      } catch (_err) {
-        state.reputation = null;
-      }
-      renderReputation();
-    }
-
-    async function refresh() {
-      try {
-        const [health, epoch, miners, agentStats, agentJobs] = await Promise.all([
-          fetchJson("/health"),
-          fetchJson("/epoch"),
-          fetchJson("/api/miners"),
-          fetchJson("/agent/stats").catch(() => ({ stats: {} })),
-          fetchJson("/agent/jobs").catch(() => ({ jobs: [] })),
-        ]);
-        state.miners = Array.isArray(miners) ? miners : [];
-        state.agentStats = agentStats;
-        state.agentJobs = Array.isArray(agentJobs.jobs) ? agentJobs.jobs : [];
-        renderTopCards(health, epoch);
-        setupFilters();
-        renderMinerTable();
-        renderAgentCards();
-        renderLifecycle();
-        setupJobCategoryFilter();
-        renderJobsTable();
-        document.getElementById("updatedAt").textContent = `Last update: ${new Date().toLocaleTimeString()}`;
-        document.getElementById("agentUpdatedAt").textContent = `Agent update: ${new Date().toLocaleTimeString()}`;
-      } catch (err) {
-        document.getElementById("topCards").innerHTML = `<div class="card"><div class="label">Error</div><div class="value">${String(err.message || err)}</div></div>`;
-        document.getElementById("minerRows").innerHTML = "";
-      }
-    }
-
-    document.getElementById("refreshBtn").addEventListener("click", refresh);
-    document.getElementById("archFilter").addEventListener("change", (e) => {
-      state.archFilter = e.target.value;
-      renderMinerTable();
-    });
-    document.getElementById("statusFilter").addEventListener("change", (e) => {
-      state.statusFilter = e.target.value;
-      renderMinerTable();
-    });
-    document.getElementById("jobCategoryFilter").addEventListener("change", (e) => {
-      state.jobCategoryFilter = e.target.value;
-      renderJobsTable();
-    });
-    document.getElementById("agentRefreshBtn").addEventListener("click", refresh);
-    document.getElementById("repLookupBtn").addEventListener("click", lookupReputation);
-    document.querySelectorAll("th button[data-sort]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const key = btn.getAttribute("data-sort");
-        if (state.sortBy === key) {
-          state.sortDir = state.sortDir === "asc" ? "desc" : "asc";
-        } else {
-          state.sortBy = key;
-          state.sortDir = key === "multiplier" || key === "last_attest" ? "desc" : "asc";
+                document.getElementById('stats').innerHTML = statsHtml;
+            } catch (error) {
+                document.getElementById('stats').innerHTML = `<div class="error">Error loading stats: ${error.message}</div>`;
+            }
         }
-        renderMinerTable();
-      });
-    });
 
-    refresh();
-    setInterval(refresh, 30000);
-  </script>
+        async function queryBalance() {
+            const minerPk = document.getElementById('minerPk').value.trim();
+            const resultDiv = document.getElementById('balanceResult');
+
+            if (!minerPk) {
+                resultDiv.innerHTML = '<span class="error">Please enter a miner public key</span>';
+                resultDiv.style.display = 'block';
+                return;
+            }
+
+            try {
+                const balance = await apiCall(`/balance/${encodeURIComponent(minerPk)}`);
+                resultDiv.innerHTML = `<span class="success">Balance for ${balance.miner_pk}:
+${balance.balance_rtc.toFixed(6)} RTC</span>`;
+                resultDiv.style.display = 'block';
+            } catch (error) {
+                resultDiv.innerHTML = `<span class="error">Error querying balance: ${error.message}</span>`;
+                resultDiv.style.display = 'block';
+            }
+        }
+
+        async function queryWithdrawals() {
+            const minerPk = document.getElementById('withdrawalMinerPk').value.trim();
+            const limit = document.getElementById('withdrawalLimit').value || 50;
+            const resultDiv = document.getElementById('withdrawalResult');
+
+            if (!minerPk) {
+                resultDiv.innerHTML = '<span class="error">Please enter a miner public key</span>';
+                resultDiv.style.display = 'block';
+                return;
+            }
+
+            try {
+                const history = await apiCall(`/withdraw/history/${encodeURIComponent(minerPk)}?limit=${limit}`);
+                let output = `<span class="success">Withdrawal History for ${history.miner_pk}:
+Current Balance: ${history.current_balance.toFixed(6)} RTC
+
+Withdrawals (${history.withdrawals.length}):`;
+
+                if (history.withdrawals.length === 0) {
+                    output += '\\nNo withdrawals found.';
+                } else {
+                    history.withdrawals.forEach((w, i) => {
+                        const date = new Date(w.created_at * 1000).toISOString();
+                        output += `\\n${i + 1}. ${w.withdrawal_id}
+   Amount: ${w.amount} RTC (Fee: ${w.fee} RTC)
+   Status: ${w.status}
+   Destination: ${w.destination}
+   Created: ${date}`;
+                        if (w.tx_hash) output += `\\n   TX Hash: ${w.tx_hash}`;
+                    });
+                }
+                output += '</span>';
+
+                resultDiv.innerHTML = output;
+                resultDiv.style.display = 'block';
+            } catch (error) {
+                resultDiv.innerHTML = `<span class="error">Error querying withdrawals: ${error.message}</span>`;
+                resultDiv.style.display = 'block';
+            }
+        }
+
+        async function queryEpoch() {
+            const resultDiv = document.getElementById('epochResult');
+
+            try {
+                const epoch = await apiCall('/epoch');
+                const output = `<span class="success">Current Epoch Information:
+Epoch: ${epoch.epoch}
+Slot: ${epoch.slot}
+Epoch Pot: ${epoch.epoch_pot} RTC
+Enrolled Miners: ${epoch.enrolled_miners}
+Blocks per Epoch: ${epoch.blocks_per_epoch}</span>`;
+
+                resultDiv.innerHTML = output;
+                resultDiv.style.display = 'block';
+            } catch (error) {
+                resultDiv.innerHTML = `<span class="error">Error querying epoch: ${error.message}</span>`;
+                resultDiv.style.display = 'block';
+            }
+        }
+
+        // Load stats on page load
+        loadStats();
+
+        // Auto-refresh stats every 30 seconds
+        setInterval(loadStats, 30000);
+    </script>
 </body>
 </html>"""
     return html
@@ -2619,25 +1797,23 @@ def _check_hardware_binding(miner_id: str, device: dict, signals: dict = None, s
 def submit_attestation():
     """Submit hardware attestation with fingerprint validation"""
     data = request.get_json(silent=True)
+
+    # Type guard: reject non-dict JSON payloads (null, array, scalar)
     if not isinstance(data, dict):
-        return jsonify({
-            "ok": False,
-            "error": "invalid_json_object",
-            "message": "Expected a JSON object request body",
-            "code": "INVALID_JSON_OBJECT"
-        }), 400
-    payload_error = _validate_attestation_payload_shape(data)
-    if payload_error is not None:
-        return payload_error
+        return jsonify({"ok": False, "error": "Request body must be a JSON object", "code": "INVALID_JSON_OBJECT"}), 400
 
     # Extract client IP (handle nginx proxy)
     client_ip = get_client_ip()
+    if client_ip and "," in client_ip:
+        client_ip = client_ip.split(",")[0].strip()  # First IP in chain
 
-    # Extract attestation data
-    miner = _attest_valid_miner(data.get('miner')) or _attest_valid_miner(data.get('miner_id'))
-    report = _normalize_attestation_report(data.get('report'))
-    nonce = report.get('nonce') or _attest_text(data.get('nonce'))
-    device = _normalize_attestation_device(data.get('device'))
+    # Extract attestation data (type guards for fuzz safety)
+    miner = data.get('miner') or data.get('miner_id')
+    if miner is not None and not isinstance(miner, str):
+        miner = str(miner)
+    report = data.get('report', {}) if isinstance(data.get('report'), dict) else {}
+    nonce = report.get('nonce') or data.get('nonce')
+    device = data.get('device', {}) if isinstance(data.get('device'), dict) else {}
 
     # IP rate limiting (Security Hardening 2026-02-02)
     ip_ok, ip_reason = check_ip_rate_limit(client_ip, miner)
@@ -2649,8 +1825,12 @@ def submit_attestation():
             "message": "Too many unique miners from this IP address",
             "code": "IP_RATE_LIMIT"
         }), 429
-    signals = _normalize_attestation_signals(data.get('signals'))
-    fingerprint = _attest_mapping(data.get('fingerprint'))  # NEW: Extract fingerprint
+    signals = data.get('signals', {}) if isinstance(data.get('signals'), dict) else {}
+    fingerprint = data.get('fingerprint')  # FIX #305: None default to detect missing vs empty
+
+    # Basic validation
+    if not miner:
+        miner = f"anon_{secrets.token_hex(8)}"
 
     # SECURITY: Check blocked wallets
     with sqlite3.connect(DB_PATH) as conn:
@@ -2662,9 +1842,9 @@ def submit_attestation():
 
     # SECURITY: Hardware binding check v2.0 (serial + entropy validation)
     serial = device.get('serial_number') or device.get('serial') or signals.get('serial')
-    cores = _attest_positive_int(device.get('cores'), default=1)
-    arch = _attest_text(device.get('arch')) or _attest_text(device.get('device_arch')) or 'modern'
-    macs = _attest_string_list(signals.get('macs'))
+    cores = device.get('cores', 1)
+    arch = device.get('arch') or device.get('device_arch', 'modern')
+    macs = signals.get('macs', [])
     
     if HW_BINDING_V2 and serial:
         hw_ok, hw_msg, hw_details = bind_hardware_v2(
@@ -2697,6 +1877,7 @@ def submit_attestation():
             }), 409
 
     # RIP-0147a: Check OUI gate
+    macs = signals.get('macs', [])
     if macs:
         oui_ok, oui_info = _check_oui_gate(macs)
         if not oui_ok:
@@ -2733,47 +1914,8 @@ def submit_attestation():
         print(f"[VM_CHECK] Miner: {miner} - VM DETECTED (zero rewards): {vm_reason}")
         fingerprint_passed = False  # Mark as failed for zero weight
 
-    # Warthog dual-mining proof verification
-    # SECURITY: Warthog bonus requires passing hardware fingerprint.
-    # Without this gate, VMs could fake/run Warthog and farm the bonus.
-    warthog_proof = data.get('warthog')
-    warthog_bonus = 1.0
-    if HAVE_WARTHOG and warthog_proof and isinstance(warthog_proof, dict) and warthog_proof.get('enabled'):
-        if not fingerprint_passed:
-            print(f"[WARTHOG] Miner: {miner[:20]}... DENIED - fingerprint failed, no dual-mining bonus")
-        else:
-            try:
-                verified, bonus_tier, wart_reason = verify_warthog_proof(warthog_proof, miner)
-                warthog_bonus = bonus_tier if verified else 1.0
-                _wart_epoch = slot_to_epoch(current_slot())
-                with sqlite3.connect(DB_PATH) as wart_conn:
-                    record_warthog_proof(wart_conn, miner, _wart_epoch, warthog_proof, verified, warthog_bonus, wart_reason)
-                print(f"[WARTHOG] Miner: {miner[:20]}... verified={verified} bonus={warthog_bonus}x reason={wart_reason}")
-            except Exception as _we:
-                print(f"[WARTHOG] Verification error for {miner[:20]}...: {_we}")
-                warthog_bonus = 1.0
-
     # Record successful attestation (with fingerprint status)
     record_attestation_success(miner, device, fingerprint_passed, client_ip, signals=signals, fingerprint=fingerprint)
-
-    temporal_review = {"score": 1.0, "review_flag": False, "reason": "insufficient_history", "flags": [], "check_scores": {}}
-    try:
-        with sqlite3.connect(DB_PATH) as tconn:
-            temporal_review = validate_temporal_consistency(fetch_miner_fingerprint_sequence(tconn, miner))
-    except Exception as _te:
-        print(f"[TEMPORAL] Warning: {_te}")
-
-    # Update warthog_bonus in attestation record
-    if warthog_bonus > 1.0:
-        try:
-            with sqlite3.connect(DB_PATH) as wb_conn:
-                wb_conn.execute(
-                    "UPDATE miner_attest_recent SET warthog_bonus=? WHERE miner=?",
-                    (warthog_bonus, miner)
-                )
-                wb_conn.commit()
-        except Exception:
-            pass  # Column may not exist yet
 
     # Record MACs if provided
     if macs:
@@ -2783,9 +1925,8 @@ def submit_attestation():
     # This eliminates the need for miners to make a separate POST /epoch/enroll call
     try:
         epoch = slot_to_epoch(current_slot())
-        verified_device = derive_verified_device(device or {}, fingerprint if isinstance(fingerprint, dict) else {}, fingerprint_passed)
-        family = verified_device["device_family"]
-        arch_for_weight = verified_device["device_arch"]
+        family = device.get("device_family") or device.get("family") or "x86"
+        arch_for_weight = device.get("device_arch") or device.get("arch") or "default"
         hw_weight = HARDWARE_WEIGHTS.get(family, {}).get(arch_for_weight, HARDWARE_WEIGHTS.get(family, {}).get("default", 1.0))
         
         # VM miners get minimal weight
@@ -2793,10 +1934,6 @@ def submit_attestation():
             enroll_weight = 0.000000001
         else:
             enroll_weight = hw_weight
-
-        # Issue #19 temporal consistency only sets a review flag (no hard-fail).
-        if temporal_review.get("review_flag"):
-            app.logger.warning(f"[TEMPORAL-REVIEW] {miner[:20]}... flags={temporal_review.get('flags', [])}")
         
         miner_id = data.get("miner_id", miner)
         
@@ -2848,9 +1985,7 @@ def submit_attestation():
         "status": "accepted",
         "device": device,
         "fingerprint_passed": fingerprint_passed,
-        "temporal_review_flag": bool(temporal_review.get("review_flag")),
-        "macs_recorded": len(macs) if macs else 0,
-        "warthog_bonus": warthog_bonus
+        "macs_recorded": len(macs) if macs else 0
     })
 
 # ============= EPOCH ENDPOINTS =============
@@ -2884,6 +2019,8 @@ def enroll_epoch():
 
     # Extract client IP (handle nginx proxy)
     client_ip = get_client_ip()
+    if client_ip and "," in client_ip:
+        client_ip = client_ip.split(",")[0].strip()  # First IP in chain
     miner_pk = data.get('miner_pubkey')
     miner_id = data.get('miner_id', miner_pk)  # Use miner_id if provided
     device = data.get('device', {})
@@ -3248,6 +2385,8 @@ def register_withdrawal_key():
 
     # Extract client IP (handle nginx proxy)
     client_ip = get_client_ip()
+    if client_ip and "," in client_ip:
+        client_ip = client_ip.split(",")[0].strip()  # First IP in chain
     miner_pk = data.get('miner_pk')
     pubkey_sr25519 = data.get('pubkey_sr25519')
 
@@ -3299,6 +2438,8 @@ def request_withdrawal():
 
     # Extract client IP (handle nginx proxy)
     client_ip = get_client_ip()
+    if client_ip and "," in client_ip:
+        client_ip = client_ip.split(",")[0].strip()  # First IP in chain
     miner_pk = data.get('miner_pk')
     amount = float(data.get('amount', 0))
     destination = data.get('destination')
@@ -3728,268 +2869,6 @@ def gov_rotate_commit():
             "approvals": int(count),
             "threshold": thr
         })
-
-@app.route('/governance/propose', methods=['POST'])
-def governance_propose():
-    data = request.get_json(silent=True) or {}
-    proposer_wallet = str(data.get('wallet', '')).strip()
-    title = str(data.get('title', '')).strip()
-    description = str(data.get('description', '')).strip()
-
-    if not proposer_wallet or not title or not description:
-        return jsonify({"ok": False, "error": "wallet, title and description are required"}), 400
-
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        _ensure_governance_tables(c)
-
-        balance_i64 = _balance_i64_for_wallet(c, proposer_wallet)
-        balance_rtc = balance_i64 / 1_000_000.0
-        if balance_rtc <= GOVERNANCE_MIN_PROPOSER_BALANCE_RTC:
-            return jsonify({
-                "ok": False,
-                "error": "insufficient_balance_to_propose",
-                "required_gt_rtc": GOVERNANCE_MIN_PROPOSER_BALANCE_RTC,
-                "balance_rtc": balance_rtc,
-            }), 403
-
-        now = int(time.time())
-        ends_at = now + GOVERNANCE_ACTIVE_SECONDS
-        c.execute(
-            """
-            INSERT INTO governance_proposals
-            (proposer_wallet, title, description, created_at, activated_at, ends_at, status)
-            VALUES (?, ?, ?, ?, ?, ?, 'active')
-            """,
-            (proposer_wallet, title, description, now, now, ends_at),
-        )
-        proposal_id = c.lastrowid
-        conn.commit()
-
-    return jsonify({
-        "ok": True,
-        "proposal": {
-            "id": proposal_id,
-            "wallet": proposer_wallet,
-            "title": title,
-            "description": description,
-            "status": "active",
-            "created_at": now,
-            "activated_at": now,
-            "ends_at": ends_at,
-            "rules": {
-                "lifecycle": "Draft -> Active (7 days) -> Passed/Failed",
-                "pass_condition": "yes_weight > no_weight at close"
-            }
-        }
-    }), 201
-
-
-@app.route('/governance/proposals', methods=['GET'])
-def governance_proposals():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        _ensure_governance_tables(c)
-
-        rows = c.execute(
-            """
-            SELECT id, proposer_wallet, title, description, created_at, activated_at, ends_at,
-                   status, yes_weight, no_weight
-            FROM governance_proposals
-            ORDER BY id DESC
-            """
-        ).fetchall()
-
-        proposals = []
-        for row in rows:
-            status = _refresh_proposal_status(c, row)
-            proposals.append({
-                "id": row["id"],
-                "proposer_wallet": row["proposer_wallet"],
-                "title": row["title"],
-                "description": row["description"],
-                "created_at": row["created_at"],
-                "activated_at": row["activated_at"],
-                "ends_at": row["ends_at"],
-                "status": status,
-                "yes_weight": float(row["yes_weight"] or 0.0),
-                "no_weight": float(row["no_weight"] or 0.0),
-            })
-        conn.commit()
-
-    return jsonify({"ok": True, "count": len(proposals), "proposals": proposals})
-
-
-@app.route('/governance/proposal/<int:proposal_id>', methods=['GET'])
-def governance_proposal_detail(proposal_id: int):
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        _ensure_governance_tables(c)
-        row = c.execute(
-            """
-            SELECT id, proposer_wallet, title, description, created_at, activated_at, ends_at,
-                   status, yes_weight, no_weight
-            FROM governance_proposals
-            WHERE id = ?
-            """,
-            (proposal_id,),
-        ).fetchone()
-
-        if not row:
-            return jsonify({"ok": False, "error": "proposal_not_found"}), 404
-
-        status = _refresh_proposal_status(c, row)
-
-        votes = c.execute(
-            """
-            SELECT voter_wallet, vote, weight, multiplier, base_balance_rtc, created_at
-            FROM governance_votes
-            WHERE proposal_id = ?
-            ORDER BY created_at DESC
-            """,
-            (proposal_id,),
-        ).fetchall()
-        conn.commit()
-
-    yes_weight = float(row["yes_weight"] or 0.0)
-    no_weight = float(row["no_weight"] or 0.0)
-    total_weight = yes_weight + no_weight
-
-    return jsonify({
-        "ok": True,
-        "proposal": {
-            "id": row["id"],
-            "proposer_wallet": row["proposer_wallet"],
-            "title": row["title"],
-            "description": row["description"],
-            "created_at": row["created_at"],
-            "activated_at": row["activated_at"],
-            "ends_at": row["ends_at"],
-            "status": status,
-            "yes_weight": yes_weight,
-            "no_weight": no_weight,
-            "total_weight": total_weight,
-            "result": "passed" if status == "passed" else ("failed" if status == "failed" else "pending"),
-        },
-        "votes": [dict(v) for v in votes],
-    })
-
-
-@app.route('/governance/vote', methods=['POST'])
-def governance_vote():
-    data = request.get_json(silent=True) or {}
-    proposal_id = int(data.get('proposal_id') or 0)
-    wallet = str(data.get('wallet', '')).strip()
-    vote = str(data.get('vote', '')).strip().lower()
-    nonce = str(data.get('nonce', '')).strip()
-    signature = str(data.get('signature', '')).strip()
-    public_key = str(data.get('public_key', '')).strip()
-
-    if not all([proposal_id, wallet, vote in ('yes', 'no'), nonce, signature, public_key]):
-        return jsonify({
-            "ok": False,
-            "error": "proposal_id, wallet, vote(yes/no), nonce, signature, public_key are required",
-        }), 400
-
-    expected_wallet = address_from_pubkey(public_key)
-    if wallet != expected_wallet:
-        return jsonify({
-            "ok": False,
-            "error": "wallet_does_not_match_public_key",
-            "expected": expected_wallet,
-            "got": wallet,
-        }), 400
-
-    vote_message = json.dumps({
-        "proposal_id": proposal_id,
-        "wallet": wallet,
-        "vote": vote,
-        "nonce": nonce,
-    }, sort_keys=True, separators=(",", ":")).encode()
-
-    if not verify_rtc_signature(public_key, vote_message, signature):
-        return jsonify({"ok": False, "error": "invalid_signature"}), 401
-
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        _ensure_governance_tables(c)
-
-        proposal = c.execute(
-            "SELECT * FROM governance_proposals WHERE id = ?",
-            (proposal_id,),
-        ).fetchone()
-        if not proposal:
-            return jsonify({"ok": False, "error": "proposal_not_found"}), 404
-
-        status = _refresh_proposal_status(c, proposal)
-        if status != 'active':
-            conn.commit()
-            return jsonify({"ok": False, "error": "proposal_not_active", "status": status}), 409
-
-        already = c.execute(
-            "SELECT 1 FROM governance_votes WHERE proposal_id = ? AND voter_wallet = ?",
-            (proposal_id, wallet),
-        ).fetchone()
-        if already:
-            return jsonify({"ok": False, "error": "already_voted"}), 409
-
-        miner_active, multiplier, miner_reason = _get_active_miner_antiquity_multiplier(c, wallet)
-        if not miner_active:
-            return jsonify({"ok": False, "error": "inactive_miner", "reason": miner_reason}), 403
-
-        base_balance_i64 = _balance_i64_for_wallet(c, wallet)
-        base_balance_rtc = base_balance_i64 / 1_000_000.0
-        if base_balance_rtc <= 0:
-            return jsonify({"ok": False, "error": "no_balance"}), 403
-
-        weight = base_balance_rtc * multiplier
-        c.execute(
-            """
-            INSERT INTO governance_votes
-            (proposal_id, voter_wallet, vote, weight, multiplier, base_balance_rtc, signature, public_key, nonce, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (proposal_id, wallet, vote, weight, multiplier, base_balance_rtc, signature, public_key, nonce, int(time.time())),
-        )
-
-        if vote == 'yes':
-            c.execute("UPDATE governance_proposals SET yes_weight = yes_weight + ? WHERE id = ?", (weight, proposal_id))
-        else:
-            c.execute("UPDATE governance_proposals SET no_weight = no_weight + ? WHERE id = ?", (weight, proposal_id))
-
-        updated = c.execute(
-            "SELECT yes_weight, no_weight, status, ends_at FROM governance_proposals WHERE id = ?",
-            (proposal_id,),
-        ).fetchone()
-        conn.commit()
-
-    yes_weight = float(updated[0] or 0.0)
-    no_weight = float(updated[1] or 0.0)
-    status = updated[2]
-
-    return jsonify({
-        "ok": True,
-        "proposal_id": proposal_id,
-        "voter_wallet": wallet,
-        "vote": vote,
-        "base_balance_rtc": base_balance_rtc,
-        "antiquity_multiplier": multiplier,
-        "vote_weight": weight,
-        "status": status,
-        "yes_weight": yes_weight,
-        "no_weight": no_weight,
-        "result": "passed" if status == "passed" else ("failed" if status == "failed" else "pending"),
-    })
-
-
-@app.route('/governance/ui', methods=['GET'])
-def governance_ui_page():
-    return send_file(os.path.join(REPO_ROOT, 'web', 'governance.html'))
-
 
 # ============= GENESIS EXPORT (RIP-0144) =============
 
@@ -4511,6 +3390,8 @@ def add_oui_deny():
 
     # Extract client IP (handle nginx proxy)
     client_ip = get_client_ip()
+    if client_ip and "," in client_ip:
+        client_ip = client_ip.split(",")[0].strip()  # First IP in chain
     oui = data.get('oui', '').lower().replace(':', '').replace('-', '')
     vendor = data.get('vendor', 'Unknown')
     enforce = int(data.get('enforce', 0))
@@ -4536,6 +3417,8 @@ def remove_oui_deny():
 
     # Extract client IP (handle nginx proxy)
     client_ip = get_client_ip()
+    if client_ip and "," in client_ip:
+        client_ip = client_ip.split(",")[0].strip()  # First IP in chain
     oui = data.get('oui', '').lower().replace(':', '').replace('-', '')
 
     with sqlite3.connect(DB_PATH) as conn:
@@ -4600,6 +3483,8 @@ def attest_debug():
 
     # Extract client IP (handle nginx proxy)
     client_ip = get_client_ip()
+    if client_ip and "," in client_ip:
+        client_ip = client_ip.split(",")[0].strip()  # First IP in chain
     miner = data.get('miner') or data.get('miner_id')
 
     if not miner:
@@ -5272,6 +4157,8 @@ def wallet_transfer_OLD():
 
     # Extract client IP (handle nginx proxy)
     client_ip = get_client_ip()
+    if client_ip and "," in client_ip:
+        client_ip = client_ip.split(",")[0].strip()  # First IP in chain
     from_miner = data.get('from_miner')
     to_miner = data.get('to_miner')
     amount_rtc = float(data.get('amount_rtc', 0))
@@ -5539,92 +4426,6 @@ def address_from_pubkey(public_key_hex: str) -> str:
     pubkey_hash = hashlib.sha256(bytes.fromhex(public_key_hex)).hexdigest()[:40]
     return f"RTC{pubkey_hash}"
 
-def _ensure_governance_tables(c: sqlite3.Cursor) -> None:
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS governance_proposals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            proposer_wallet TEXT NOT NULL,
-            title TEXT NOT NULL,
-            description TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            activated_at INTEGER,
-            ends_at INTEGER,
-            status TEXT NOT NULL DEFAULT 'draft',
-            yes_weight REAL NOT NULL DEFAULT 0,
-            no_weight REAL NOT NULL DEFAULT 0
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS governance_votes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            proposal_id INTEGER NOT NULL,
-            voter_wallet TEXT NOT NULL,
-            vote TEXT NOT NULL,
-            weight REAL NOT NULL,
-            multiplier REAL NOT NULL,
-            base_balance_rtc REAL NOT NULL,
-            signature TEXT NOT NULL,
-            public_key TEXT NOT NULL,
-            nonce TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            UNIQUE(proposal_id, voter_wallet),
-            FOREIGN KEY (proposal_id) REFERENCES governance_proposals(id)
-        )
-    """)
-
-
-def _get_active_miner_antiquity_multiplier(c: sqlite3.Cursor, wallet: str):
-    row = c.execute(
-        """
-        SELECT ts_ok, device_family, device_arch
-        FROM miner_attest_recent
-        WHERE miner = ?
-        """,
-        (wallet,),
-    ).fetchone()
-    if not row or not row[0]:
-        return False, 0.0, "miner_not_attested"
-
-    age = int(time.time()) - int(row[0])
-    if age > GOVERNANCE_ACTIVE_MINER_WINDOW_SECONDS:
-        return False, 0.0, "miner_not_active"
-
-    family = row[1] or "unknown"
-    arch = row[2] or "unknown"
-    multiplier = HARDWARE_WEIGHTS.get(family, {}).get(
-        arch,
-        HARDWARE_WEIGHTS.get(family, {}).get("default", 1.0),
-    )
-    return True, float(multiplier), "ok"
-
-
-def _refresh_proposal_status(c: sqlite3.Cursor, proposal_row: sqlite3.Row):
-    now = int(time.time())
-    status = (proposal_row["status"] or "draft").lower()
-    ends_at = proposal_row["ends_at"]
-
-    if status == "draft":
-        activated_at = now
-        ends_at = now + GOVERNANCE_ACTIVE_SECONDS
-        c.execute(
-            "UPDATE governance_proposals SET status='active', activated_at=?, ends_at=? WHERE id=?",
-            (activated_at, ends_at, proposal_row["id"]),
-        )
-        status = "active"
-
-    if status == "active" and ends_at and now >= int(ends_at):
-        yes_weight = float(proposal_row["yes_weight"] or 0.0)
-        no_weight = float(proposal_row["no_weight"] or 0.0)
-        final_status = "passed" if yes_weight > no_weight else "failed"
-        c.execute(
-            "UPDATE governance_proposals SET status=? WHERE id=?",
-            (final_status, proposal_row["id"]),
-        )
-        status = final_status
-
-    return status
-
-
 def _balance_i64_for_wallet(c: sqlite3.Cursor, wallet_id: str) -> int:
     """
     Return wallet balance in micro-units (i64), tolerant to historical schema.
@@ -5782,6 +4583,8 @@ def wallet_transfer_signed():
 
     # Extract client IP (handle nginx proxy)
     client_ip = get_client_ip()
+    if client_ip and "," in client_ip:
+        client_ip = client_ip.split(",")[0].strip()  # First IP in chain
     
     from_address = pre.details["from_address"]
     to_address = pre.details["to_address"]
