@@ -1,0 +1,173 @@
+groups:
+  - name: rustchain_alerts
+    interval: 1m
+    rules:
+      # Node Health Alerts
+      - alert: RustChainNodeDown
+        expr: rustchain_node_health == 0
+        for: 2m
+        labels:
+          severity: critical
+          team: infrastructure
+        annotations:
+          summary: "RustChain node is down"
+          description: "Node {{ $labels.instance }} has been unhealthy for more than 2 minutes"
+          runbook_url: "https://github.com/Scottcjn/Rustchain/blob/main/monitoring/RUNBOOK.md#node-down"
+
+      - alert: RustChainNodeUnhealthy
+        expr: rustchain_node_db_status == 0
+        for: 5m
+        labels:
+          severity: warning
+          team: infrastructure
+        annotations:
+          summary: "RustChain node database issue"
+          description: "Node {{ $labels.instance }} database status is error for 5 minutes"
+
+      # Miner Alerts
+      - alert: RustChainMinerDrop
+        expr: rate(rustchain_active_miners_total[5m]) < -0.2
+        for: 5m
+        labels:
+          severity: warning
+          team: mining
+        annotations:
+          summary: "Significant miner drop detected"
+          description: "Active miners on {{ $labels.instance }} decreased by >20% in 5 minutes"
+          runbook_url: "https://github.com/Scottcjn/Rustchain/blob/main/monitoring/RUNBOOK.md#miner-drop"
+
+      - alert: RustChainNoMiners
+        expr: rustchain_active_miners_total == 0
+        for: 10m
+        labels:
+          severity: critical
+          team: mining
+        annotations:
+          summary: "No active miners"
+          description: "Node {{ $labels.instance }} has no active miners for 10 minutes"
+
+      - alert: RustChainLowMinerCount
+        expr: rustchain_active_miners_total < 5
+        for: 30m
+        labels:
+          severity: warning
+          team: mining
+        annotations:
+          summary: "Low miner count"
+          description: "Node {{ $labels.instance }} has fewer than 5 active miners"
+
+      # Performance Alerts
+      - alert: RustChainSlowScrape
+        expr: rustchain_scrape_duration_seconds > 5
+        for: 5m
+        labels:
+          severity: warning
+          team: infrastructure
+        annotations:
+          summary: "Slow metric collection"
+          description: "Scrape duration for {{ $labels.instance }} exceeds 5 seconds"
+
+      - alert: RustChainHighScrapeErrors
+        expr: rate(rustchain_scrape_errors_total[5m]) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+          team: infrastructure
+        annotations:
+          summary: "High scrape error rate"
+          description: "Scrape error rate for {{ $labels.instance }} is {{ $value }} errors/sec"
+
+      - alert: RustChainAPILatency
+        expr: histogram_quantile(0.95, rate(rustchain_api_request_duration_seconds_bucket[5m])) > 2
+        for: 10m
+        labels:
+          severity: warning
+          team: infrastructure
+        annotations:
+          summary: "High API latency"
+          description: "95th percentile API latency for {{ $labels.instance }} is {{ $value }}s"
+
+      # Blockchain Alerts
+      - alert: RustChainEpochStalled
+        expr: delta(rustchain_epoch_number[10m]) == 0
+        for: 15m
+        labels:
+          severity: warning
+          team: blockchain
+        annotations:
+          summary: "Epoch not advancing"
+          description: "Epoch number has not changed for 15 minutes on {{ $labels.instance }}"
+
+      - alert: RustChainHighTXPool
+        expr: rustchain_tx_pool_size > 500
+        for: 10m
+        labels:
+          severity: warning
+          team: blockchain
+        annotations:
+          summary: "High transaction pool size"
+          description: "Transaction pool on {{ $labels.instance }} has {{ $value }} pending transactions"
+
+      - alert: RustChainTXPoolCritical
+        expr: rustchain_tx_pool_size > 1000
+        for: 5m
+        labels:
+          severity: critical
+          team: blockchain
+        annotations:
+          summary: "Critical transaction pool backlog"
+          description: "Transaction pool on {{ $labels.instance }} has {{ $value }} pending transactions"
+
+      # Supply Alerts
+      - alert: RustChainSupplyAnomaly
+        expr: delta(rustchain_total_supply_rtc[1h]) < 0
+        for: 1h
+        labels:
+          severity: critical
+          team: blockchain
+        annotations:
+          summary: "Total supply decreased"
+          description: "Total RTC supply decreased on {{ $labels.instance }} - possible data issue"
+
+      # Exporter Alerts
+      - alert: RustChainExporterDown
+        expr: up{job="rustchain-exporter"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          team: infrastructure
+        annotations:
+          summary: "Prometheus exporter is down"
+          description: "RustChain exporter {{ $labels.instance }} is not responding"
+
+      - alert: RustChainExporterRestart
+        expr: changes(process_start_time_seconds{job="rustchain-exporter"}[1h]) > 2
+        for: 5m
+        labels:
+          severity: warning
+          team: infrastructure
+        annotations:
+          summary: "Frequent exporter restarts"
+          description: "Exporter {{ $labels.instance }} has restarted multiple times in the last hour"
+
+  # Recording rules for common queries
+  - name: rustchain_recording_rules
+    interval: 30s
+    rules:
+      # Pre-compute miner rate of change
+      - record: rustchain_active_miners_rate_5m
+        expr: rate(rustchain_active_miners_total[5m])
+
+      # Pre-compute error rates
+      - record: rustchain_scrape_error_rate_5m
+        expr: rate(rustchain_scrape_errors_total[5m])
+
+      # Pre-compute API latency percentiles
+      - record: rustchain_api_latency_p50
+        expr: histogram_quantile(0.50, rate(rustchain_api_request_duration_seconds_bucket[5m]))
+
+      - record: rustchain_api_latency_p95
+        expr: histogram_quantile(0.95, rate(rustchain_api_request_duration_seconds_bucket[5m]))
+
+      - record: rustchain_api_latency_p99
+        expr: histogram_quantile(0.99, rate(rustchain_api_request_duration_seconds_bucket[5m]))

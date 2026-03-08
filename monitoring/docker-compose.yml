@@ -1,18 +1,41 @@
 version: '3.8'
 
 services:
-  rustchain-exporter:
+  # Python Exporter (default - uncomment to use)
+  # rustchain-exporter:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile.exporter
+  #   container_name: rustchain-exporter
+  #   restart: unless-stopped
+  #   environment:
+  #     - RUSTCHAIN_NODE=https://rustchain.org
+  #     - TLS_VERIFY=true
+  #     - EXPORTER_PORT=9100
+  #     - SCRAPE_INTERVAL=30
+  #   ports:
+  #     - "9100:9100"
+  #   networks:
+  #     - monitoring
+  #   logging:
+  #     driver: "json-file"
+  #     options:
+  #       max-size: "5m"
+  #       max-file: "2"
+
+  # Rust Exporter (recommended for production)
+  rustchain-exporter-rust:
     build:
       context: .
-      dockerfile: Dockerfile.exporter
-    container_name: rustchain-exporter
+      dockerfile: Dockerfile.exporter-rust
+    container_name: rustchain-exporter-rust
     restart: unless-stopped
     environment:
       - RUSTCHAIN_NODE=https://rustchain.org
-      - TLS_VERIFY=false  # Set to 'true' for production with valid certs
-      # - TLS_CA_BUNDLE=/path/to/ca-bundle.crt  # Optional: custom CA
+      - TLS_VERIFY=true
       - EXPORTER_PORT=9100
       - SCRAPE_INTERVAL=30
+      - RUST_LOG=info
     ports:
       - "9100:9100"
     networks:
@@ -22,6 +45,12 @@ services:
       options:
         max-size: "5m"
         max-file: "2"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9100/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
 
   prometheus:
     image: prom/prometheus:latest
@@ -29,6 +58,7 @@ services:
     restart: unless-stopped
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
       - prometheus-data:/prometheus
     ports:
       - "9090:9090"
@@ -36,10 +66,12 @@ services:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
       - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
     networks:
       - monitoring
     depends_on:
-      - rustchain-exporter
+      rustchain-exporter-rust:
+        condition: service_healthy
 
   grafana:
     image: grafana/grafana:latest
@@ -53,11 +85,18 @@ services:
       - "3000:3000"
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=rustchain
-      - GF_INSTALL_PLUGINS=
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=http://localhost:3000
+      - GF_AUTH_ANONYMOUS_ENABLED=false
     networks:
       - monitoring
     depends_on:
       - prometheus
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
 volumes:
   prometheus-data:

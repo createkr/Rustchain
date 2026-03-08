@@ -1,12 +1,28 @@
+# RustChain Prometheus Exporter - Python Implementation
 FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY requirements.txt ./
+# Install dependencies
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY rustchain-exporter.py ./
+# Copy exporter
+COPY rustchain-exporter.py .
 
+# Create non-root user
+RUN useradd -r -s /bin/false rustchain
+RUN chown -R rustchain:rustchain /app
+
+# Switch to non-root user
+USER rustchain
+
+# Expose metrics port
 EXPOSE 9100
 
-CMD ["python3", "rustchain-exporter.py"]
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python -c "import requests; requests.get('http://localhost:9100/health')" || exit 1
+
+# Run the exporter
+CMD ["python", "rustchain-exporter.py"]
