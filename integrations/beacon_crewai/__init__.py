@@ -16,13 +16,16 @@ Modules:
 """
 
 from .beacon_config import BeaconConfig
-from .beacon_crewai import BeaconAgent, create_beacon_crew
+from .beacon_crewai import BeaconAgent, create_beacon_crew, BEACON_SKILL_AVAILABLE, CREWAI_AVAILABLE
 from .beacon_langgraph import (
     BeaconNode,
     BeaconConfig as LangGraphBeaconConfig,
     BeaconGraphState,
     create_beacon_graph,
     create_beacon_tools,
+    BEACON_SKILL_AVAILABLE as LANGGRAPH_BEACON_SKILL_AVAILABLE,
+    LANGGRAPH_AVAILABLE,
+    LANGCHAIN_AVAILABLE,
 )
 
 __version__ = "0.1.0"
@@ -32,10 +35,15 @@ __all__ = [
     # CrewAI
     "BeaconAgent",
     "create_beacon_crew",
+    "BEACON_SKILL_AVAILABLE",
+    "CREWAI_AVAILABLE",
     # LangGraph
     "BeaconNode",
     "LangGraphBeaconConfig",
     "BeaconGraphState",
     "create_beacon_graph",
     "create_beacon_tools",
+    "LANGGRAPH_BEACON_SKILL_AVAILABLE",
+    "LANGGRAPH_AVAILABLE",
+    "LANGCHAIN_AVAILABLE",
 ]

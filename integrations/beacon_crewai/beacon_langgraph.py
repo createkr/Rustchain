@@ -32,10 +32,24 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, TypedDict, Annotated
 
 from beacon_config import BeaconConfig
-from beacon_skill import AgentIdentity, HeartbeatManager
-from beacon_skill.codec import encode_envelope, decode_envelopes, verify_envelope
-from beacon_skill.contracts import ContractManager
-from beacon_skill.transports.udp import udp_listen, udp_send
+
+# Optional beacon_skill import (graceful degradation)
+try:
+    from beacon_skill import AgentIdentity, HeartbeatManager
+    from beacon_skill.codec import encode_envelope, decode_envelopes, verify_envelope
+    from beacon_skill.contracts import ContractManager
+    from beacon_skill.transports.udp import udp_listen, udp_send
+    BEACON_SKILL_AVAILABLE = True
+except ImportError:
+    BEACON_SKILL_AVAILABLE = False
+    AgentIdentity = None  # type: ignore
+    HeartbeatManager = None  # type: ignore
+    encode_envelope = None  # type: ignore
+    decode_envelopes = None  # type: ignore
+    verify_envelope = None  # type: ignore
+    ContractManager = None  # type: ignore
+    udp_listen = None  # type: ignore
+    udp_send = None  # type: ignore
 
 # Optional LangGraph imports (graceful degradation)
 try:

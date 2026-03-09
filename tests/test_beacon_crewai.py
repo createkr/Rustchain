@@ -203,11 +203,12 @@ class TestBeaconGraphState:
 class TestBehavioralWithMocks:
     """Behavioral tests mocking beacon_skill dependencies."""
 
+    @patch("beacon_crewai.ContractManager")
     @patch("beacon_crewai.AgentIdentity")
     @patch("beacon_crewai.HeartbeatManager")
     @patch("beacon_crewai.udp_send")
     @patch("beacon_crewai.encode_envelope")
-    def test_send_heartbeat_sends_udp(self, mock_encode, mock_udp_send, mock_hb_mgr, mock_identity):
+    def test_send_heartbeat_sends_udp(self, mock_encode, mock_udp_send, mock_hb_mgr, mock_identity, mock_contract_mgr):
         """Test send_heartbeat() sends UDP packet with encoded envelope."""
         from beacon_crewai import BeaconAgent, BeaconConfig
 
@@ -226,12 +227,13 @@ class TestBehavioralWithMocks:
             "127.0.0.1", 38400, b"encoded_envelope_test_string", broadcast=False
         )
 
+    @patch("beacon_crewai.ContractManager")
     @patch("beacon_crewai.AgentIdentity")
     @patch("beacon_crewai.HeartbeatManager")
     @patch("beacon_crewai.decode_envelopes")
     @patch("beacon_crewai.verify_envelope")
     def test_verify_envelope_returns_valid_result(
-        self, mock_verify, mock_decode, mock_hb_mgr, mock_identity
+        self, mock_verify, mock_decode, mock_hb_mgr, mock_identity, mock_contract_mgr
     ):
         """Test verify_envelope() returns verification result."""
         from beacon_crewai import BeaconAgent, BeaconConfig
@@ -252,11 +254,12 @@ class TestBehavioralWithMocks:
         mock_decode.assert_called_once_with("test_envelope_string")
         mock_verify.assert_called_once_with("envelope1", known_keys=None)
 
+    @patch("beacon_crewai.ContractManager")
     @patch("beacon_crewai.AgentIdentity")
     @patch("beacon_crewai.HeartbeatManager")
     @patch("beacon_crewai.decode_envelopes")
     def test_verify_envelope_invalid_envelope(
-        self, mock_decode, mock_hb_mgr, mock_identity
+        self, mock_decode, mock_hb_mgr, mock_identity, mock_contract_mgr
     ):
         """Test verify_envelope() handles invalid envelope gracefully."""
         from beacon_crewai import BeaconAgent, BeaconConfig
