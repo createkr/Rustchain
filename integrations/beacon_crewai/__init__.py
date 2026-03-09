@@ -12,10 +12,12 @@ and popular AI agent frameworks, enabling:
 Modules:
     beacon_crewai: CrewAI agent integration
     beacon_langgraph: LangGraph node integration
+    beacon_config: Shared configuration
 """
 
-from beacon_crewai import BeaconAgent, BeaconConfig, create_beacon_crew
-from beacon_langgraph import (
+from .beacon_config import BeaconConfig
+from .beacon_crewai import BeaconAgent, create_beacon_crew
+from .beacon_langgraph import (
     BeaconNode,
     BeaconConfig as LangGraphBeaconConfig,
     BeaconGraphState,
@@ -25,9 +27,10 @@ from beacon_langgraph import (
 
 __version__ = "0.1.0"
 __all__ = [
+    # Config
+    "BeaconConfig",
     # CrewAI
     "BeaconAgent",
-    "BeaconConfig",
     "create_beacon_crew",
     # LangGraph
     "BeaconNode",

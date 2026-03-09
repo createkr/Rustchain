@@ -28,10 +28,10 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, TypedDict, Annotated
 
+from beacon_config import BeaconConfig
 from beacon_skill import AgentIdentity, HeartbeatManager
 from beacon_skill.codec import encode_envelope, decode_envelopes, verify_envelope
 from beacon_skill.contracts import ContractManager
@@ -53,19 +53,6 @@ except ImportError:
     LANGCHAIN_AVAILABLE = False
 
 logger = logging.getLogger("beacon_langgraph")
-
-
-@dataclass
-class BeaconConfig:
-    """Configuration for Beacon integration."""
-    agent_id: str
-    beacon_host: str = "127.0.0.1"
-    beacon_port: int = 38400
-    data_dir: Optional[Path] = None
-    use_mnemonic: bool = False
-    broadcast_heartbeats: bool = False
-    heartbeat_interval_seconds: int = 60
-    known_keys: Optional[Dict[str, str]] = None
 
 
 class BeaconGraphState(TypedDict, total=False):

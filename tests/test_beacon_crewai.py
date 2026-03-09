@@ -200,6 +200,81 @@ class TestBeaconGraphState:
         assert isinstance(BeaconGraphState.__annotations__, dict)
 
 
+class TestBehavioralWithMocks:
+    """Behavioral tests mocking beacon_skill dependencies."""
+
+    @patch("beacon_crewai.AgentIdentity")
+    @patch("beacon_crewai.HeartbeatManager")
+    @patch("beacon_crewai.udp_send")
+    @patch("beacon_crewai.encode_envelope")
+    def test_send_heartbeat_sends_udp(self, mock_encode, mock_udp_send, mock_hb_mgr, mock_identity):
+        """Test send_heartbeat() sends UDP packet with encoded envelope."""
+        from beacon_crewai import BeaconAgent, BeaconConfig
+
+        # Setup mocks
+        mock_identity.generate.return_value.agent_id = "test-agent"
+        mock_identity.generate.return_value.pubkey = b"testpubkey"
+        mock_encode.return_value = "encoded_envelope_test_string"
+
+        config = BeaconConfig(agent_id="test-agent", beacon_host="127.0.0.1", beacon_port=38400)
+        agent = BeaconAgent(config=config)
+
+        envelope = agent.send_heartbeat(status="alive", health={"ts": 12345})
+
+        assert envelope == "encoded_envelope_test_string"
+        mock_udp_send.assert_called_once_with(
+            "127.0.0.1", 38400, b"encoded_envelope_test_string", broadcast=False
+        )
+
+    @patch("beacon_crewai.AgentIdentity")
+    @patch("beacon_crewai.HeartbeatManager")
+    @patch("beacon_crewai.decode_envelopes")
+    @patch("beacon_crewai.verify_envelope")
+    def test_verify_envelope_returns_valid_result(
+        self, mock_verify, mock_decode, mock_hb_mgr, mock_identity
+    ):
+        """Test verify_envelope() returns verification result."""
+        from beacon_crewai import BeaconAgent, BeaconConfig
+
+        # Setup mocks
+        mock_identity.generate.return_value.agent_id = "test-agent"
+        mock_identity.generate.return_value.pubkey = b"testpubkey"
+        mock_decode.return_value = ["envelope1"]
+        mock_verify.return_value = {"agent_id": "sender-agent", "pubkey": b"senderpubkey"}
+
+        config = BeaconConfig(agent_id="test-agent")
+        agent = BeaconAgent(config=config)
+
+        result = agent.verify_envelope("test_envelope_string")
+
+        assert result["valid"] is True
+        assert result["agent_id"] == "sender-agent"
+        mock_decode.assert_called_once_with("test_envelope_string")
+        mock_verify.assert_called_once_with("envelope1", known_keys=None)
+
+    @patch("beacon_crewai.AgentIdentity")
+    @patch("beacon_crewai.HeartbeatManager")
+    @patch("beacon_crewai.decode_envelopes")
+    def test_verify_envelope_invalid_envelope(
+        self, mock_decode, mock_hb_mgr, mock_identity
+    ):
+        """Test verify_envelope() handles invalid envelope gracefully."""
+        from beacon_crewai import BeaconAgent, BeaconConfig
+
+        # Setup mocks
+        mock_identity.generate.return_value.agent_id = "test-agent"
+        mock_identity.generate.return_value.pubkey = b"testpubkey"
+        mock_decode.return_value = []
+
+        config = BeaconConfig(agent_id="test-agent")
+        agent = BeaconAgent(config=config)
+
+        result = agent.verify_envelope("invalid_envelope")
+
+        assert result["valid"] is False
+        assert "error" in result or result["agent_id"] is None
+
+
 class TestIntegrationPoints:
     """Test integration points with beacon_skill."""
 

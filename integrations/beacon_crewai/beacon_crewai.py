@@ -29,10 +29,11 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from beacon_config import BeaconConfig
 from beacon_skill import AgentIdentity, HeartbeatManager
 from beacon_skill.codec import encode_envelope, decode_envelopes, verify_envelope
 from beacon_skill.contracts import ContractManager
@@ -46,19 +47,6 @@ except ImportError:
     CREWAI_AVAILABLE = False
 
 logger = logging.getLogger("beacon_crewai")
-
-
-@dataclass
-class BeaconConfig:
-    """Configuration for Beacon integration."""
-    agent_id: str
-    beacon_host: str = "127.0.0.1"
-    beacon_port: int = 38400
-    data_dir: Optional[Path] = None
-    use_mnemonic: bool = False
-    broadcast_heartbeats: bool = False
-    heartbeat_interval_seconds: int = 60
-    known_keys: Optional[Dict[str, str]] = None  # agent_id -> pubkey mapping
 
 
 @dataclass
@@ -156,7 +144,10 @@ class BeaconAgent:
             Returns:
                 Confirmation message with envelope details
             """
-            health = json.loads(health_data) if health_data else {"ts": int(time.time())}
+            try:
+                health = json.loads(health_data) if health_data else {"ts": int(time.time())}
+            except json.JSONDecodeError as e:
+                return f"Error: Invalid JSON in health_data: {e}"
             envelope = self.send_heartbeat(status=status, health=health)
             return f"Heartbeat sent: {envelope[:64]}..."
 
@@ -204,7 +195,10 @@ class BeaconAgent:
             Returns:
                 Contract ID if successful, error message otherwise
             """
-            terms_dict = json.loads(terms) if terms else {}
+            try:
+                terms_dict = json.loads(terms) if terms else {}
+            except json.JSONDecodeError as e:
+                return f"Error: Invalid JSON in terms: {e}"
             result = self.list_contract(
                 contract_type=contract_type,
                 price_rtc=price_rtc,
@@ -450,14 +444,16 @@ def create_beacon_crew(
         backstory="You are a trusted agent in the RustChain Beacon network, capable of sending signed heartbeats and attesting to work completion.",
     )
 
+    crewai_agent = beacon_agent.create_crewai_agent()
+
     task = CrewAITask(
         description=task_description,
-        agent=beacon_agent.create_crewai_agent(),
+        agent=crewai_agent,
         expected_output=expected_output,
     )
 
     crew = Crew(
-        agents=[beacon_agent.create_crewai_agent()],
+        agents=[crewai_agent],
         tasks=[task],
         verbose=True,
     )
