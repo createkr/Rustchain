@@ -10,7 +10,7 @@
 [![Open Issues](https://img.shields.io/github/issues/Scottcjn/Rustchain?color=orange)](https://github.com/Scottcjn/Rustchain/issues)
 [![PowerPC](https://img.shields.io/badge/PowerPC-G3%2FG4%2FG5-orange)](https://github.com/Scottcjn/Rustchain)
 [![Blockchain](https://img.shields.io/badge/Consensus-Proof--of--Antiquity-green)](https://github.com/Scottcjn/Rustchain)
-[![Python](https://img.shields.io/badge/Python-3.x-yellow)](https://python.org)
+[![Python](https://img.shields.io/badge/Python-3.x-yellow)](https://www.python.org)
 [![Network](https://img.shields.io/badge/Nodes-3%20Active-brightgreen)](https://rustchain.org/explorer)
 [![Bounties](https://img.shields.io/badge/Bounties-Open%20%F0%9F%92%B0-green)](https://github.com/Scottcjn/rustchain-bounties/issues)
 [![As seen on BoTTube](https://bottube.ai/badge/seen-on-bottube.svg)](https://bottube.ai)
@@ -23,6 +23,24 @@
 [Website](https://rustchain.org) • [Live Explorer](https://rustchain.org/explorer) • [Swap wRTC](https://raydium.io/swap/?inputMint=sol&outputMint=12TAdKXxcGf6oCv4rqDz2NkgxjyHq6HQKoxKZYGf5i4X) • [DexScreener](https://dexscreener.com/solana/8CF2Q8nSCxRacDShbtF86XTSrYjueBMKmfdR3MLdnYzb) • [wRTC Quickstart](docs/wrtc.md) • [wRTC Tutorial](docs/WRTC_ONBOARDING_TUTORIAL.md) • [Grokipedia Ref](https://grokipedia.com/search?q=RustChain) • [Whitepaper](docs/RustChain_Whitepaper_Flameholder_v0.97-1.pdf) • [Quick Start](#-quick-start) • [How It Works](#-how-proof-of-antiquity-works)
 
 </div>
+
+---
+
+## Q1 2026 Traction
+
+> *All data from [live GitHub API pull](https://github.com/Scottcjn/Rustchain/blob/main/docs/DEVELOPER_TRACTION_Q1_2026.md) compared against [GitClear](https://www.gitclear.com/research_studies/git_commit_count_percentiles_annual_days_active_from_largest_data_set) (878K dev-years), [LinearB](https://linearb.io/resources/software-engineering-benchmarks-report) (8.1M PRs), and [Electric Capital](https://www.developerreport.com) benchmarks.*
+
+| Metric (90 days) | Elyan Labs | Industry Median | Sei Protocol ($85M) |
+|-------------------|-----------|----------------|---------------------|
+| Commits | **1,882** | 105-168 | 297 |
+| Repos shipped | **97** | 1-3 | 0 new |
+| GitHub stars | **1,334** | 5-30 | 2,837 (lifetime) |
+| Developer interactions | **150+** | 0-2 | 78 (lifetime) |
+| Commits/dev/month | **627** | 56 | 7.6 |
+| External contributions | **32 PRs** | 0-2 | 0 |
+| Funding | **$0** | $0 | $85,000,000 |
+
+**[Full traction report with methodology and sources →](https://github.com/Scottcjn/Rustchain/blob/main/docs/DEVELOPER_TRACTION_Q1_2026.md)**
 
 ---
 
@@ -164,22 +182,22 @@ If an issue persists, include logs and OS details in a new issue or bounty comme
 **Check your wallet balance:**
 ```bash
 # Note: Using -sk flags because the node may use a self-signed SSL certificate
-curl -sk "https://50.28.86.131/wallet/balance?miner_id=YOUR_WALLET_NAME"
+curl -sk "https://rustchain.org/wallet/balance?miner_id=YOUR_WALLET_NAME"
 ```
 
 **List active miners:**
 ```bash
-curl -sk https://50.28.86.131/api/miners
+curl -sk https://rustchain.org/api/miners
 ```
 
 **Check node health:**
 ```bash
-curl -sk https://50.28.86.131/health
+curl -sk https://rustchain.org/health
 ```
 
 **Get current epoch:**
 ```bash
-curl -sk https://50.28.86.131/epoch
+curl -sk https://rustchain.org/epoch
 ```
 
 **Manage the miner service:**
@@ -220,6 +238,10 @@ Earn **RTC** by contributing to the RustChain ecosystem!
 | **AI Agent Hunter** | 200 RTC | [Agent Bounty #34](https://github.com/Scottcjn/rustchain-bounties/issues/34) |
 
 ---
+
+## Testing Notes
+
+- Attestation malformed-input fuzz harness and replayable corpus: [docs/attestation_fuzzing.md](docs/attestation_fuzzing.md)
 
 ## 💰 Antiquity Multipliers
 
@@ -310,16 +332,16 @@ This provides cryptographic proof that RustChain state existed at a specific tim
 
 ```bash
 # Check network health
-curl -sk https://50.28.86.131/health
+curl -sk https://rustchain.org/health
 
 # Get current epoch
-curl -sk https://50.28.86.131/epoch
+curl -sk https://rustchain.org/epoch
 
 # List active miners
-curl -sk https://50.28.86.131/api/miners
+curl -sk https://rustchain.org/api/miners
 
 # Check wallet balance
-curl -sk "https://50.28.86.131/wallet/balance?miner_id=YOUR_WALLET"
+curl -sk "https://rustchain.org/wallet/balance?miner_id=YOUR_WALLET"
 
 # Block explorer (web browser)
 open https://rustchain.org/explorer
@@ -407,6 +429,7 @@ Read the draft spec:
 
 ## 📝 Articles
 
+- [I Built More in 90 Days With $0 Than an $85M-Funded Team](https://dev.to/scottcjn/i-built-more-in-90-days-with-0-than-an-85m-funded-team-of-13-engineers-3oi0) - Dev.to
 - [Proof of Antiquity: A Blockchain That Rewards Vintage Hardware](https://dev.to/scottcjn/proof-of-antiquity-a-blockchain-that-rewards-vintage-hardware-4ii3) - Dev.to
 - [I Run LLMs on a 768GB IBM POWER8 Server](https://dev.to/scottcjn/i-run-llms-on-a-768gb-ibm-power8-server-and-its-faster-than-you-think-1o) - Dev.to
 
@@ -443,3 +466,22 @@ MIT License - Free to use, but please keep the copyright notice and attribution.
 ## Mining Status
 <!-- rustchain-mining-badge-start -->
 ![RustChain Mining Status](https://img.shields.io/endpoint?url=https://rustchain.org/api/badge/frozen-factorio-ryan&style=flat-square)<!-- rustchain-mining-badge-end -->
+
+### ARM64 (Raspberry Pi 4/5) quick validation
+
+```bash
+pip install clawrtc
+clawrtc mine --dry-run
+```
+
+Expected: all 6 hardware fingerprint checks execute on native ARM64 without architecture fallback errors.
+
+---
+
+<div align="center">
+
+**[Elyan Labs](https://github.com/Scottcjn)** · 1,882 commits · 97 repos · 1,334 stars · $0 raised
+
+[⭐ Star Rustchain](https://github.com/Scottcjn/Rustchain) · [📊 Q1 2026 Traction Report](https://github.com/Scottcjn/Rustchain/blob/main/docs/DEVELOPER_TRACTION_Q1_2026.md) · [Follow @Scottcjn](https://github.com/Scottcjn)
+
+</div>

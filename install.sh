@@ -12,7 +12,7 @@ set -e
 REPO_BASE="https://raw.githubusercontent.com/Scottcjn/Rustchain/main/miners"
 INSTALL_DIR="$HOME/.rustchain"
 VENV_DIR="$INSTALL_DIR/venv"
-NODE_URL="https://50.28.86.131"
+NODE_URL="https://rustchain.org"
 SERVICE_NAME="rustchain-miner"
 
 # Colors
@@ -120,6 +120,9 @@ detect_platform() {
                 ppc|powerpc)
                     echo "ppc"
                     ;;
+                arm64|aarch64|armv8*|armv7l)
+                    echo "linux_arm64"
+                    ;;
                 *)
                     echo "linux"
                     ;;
@@ -207,7 +210,7 @@ download_miner() {
 
     # Download main miner (using actual repo filenames)
     case "$platform" in
-        linux)
+        linux|linux_arm64)
             curl -sSL "$REPO_BASE/linux/rustchain_linux_miner.py" -o rustchain_miner.py
             curl -sSL "$REPO_BASE/linux/fingerprint_checks.py" -o fingerprint_checks.py
             ;;
