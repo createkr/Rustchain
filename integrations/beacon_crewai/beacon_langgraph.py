@@ -31,7 +31,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, TypedDict, Annotated
 
-from beacon_config import BeaconConfig
+from .beacon_config import BeaconConfig
 
 # Optional beacon_skill import (graceful degradation)
 try:
@@ -120,7 +120,7 @@ class BeaconNode:
         data_dir.mkdir(parents=True, exist_ok=True)
 
         self.identity = AgentIdentity.generate(use_mnemonic=config.use_mnemonic)
-        self.heartbeat_manager = HeartbeatManager(data_dir=str(data_dir / "heartbeats"))
+        self.heartbeat_manager = HeartbeatManager(data_dir=data_dir / "heartbeats")
         self.contract_manager = ContractManager(data_dir=str(data_dir / "contracts"))
 
         # Runtime counters
@@ -239,12 +239,13 @@ class BeaconNode:
                 "error": "Failed to decode envelope",
             }
 
-        result = verify_envelope(envelopes[0], known_keys=self.config.known_keys)
+        envelope_dict = envelopes[0]
+        is_valid = verify_envelope(envelope_dict, known_keys=self.config.known_keys)
 
         verification = {
-            "valid": result is not None,
-            "agent_id": result.get("agent_id") if result else None,
-            "pubkey": result.get("pubkey") if result else None,
+            "valid": is_valid,
+            "agent_id": envelope_dict.get("agent_id") if is_valid else None,
+            "pubkey": envelope_dict.get("pubkey") if is_valid else None,
         }
 
         return {
@@ -290,8 +291,8 @@ class BeaconNode:
         """
         identity = {
             "agent_id": self.identity.agent_id,
-            "pubkey": self.identity.pubkey,
-            "pubkey_hex": self.identity.pubkey.hex(),
+            "pubkey": bytes.fromhex(self.identity.public_key_hex),
+            "pubkey_hex": self.identity.public_key_hex,
         }
 
         return {
@@ -309,7 +310,7 @@ class BeaconNode:
             "agent_id": self.config.agent_id,
             "identity": {
                 "agent_id": self.identity.agent_id,
-                "pubkey_hex": self.identity.pubkey.hex(),
+                "pubkey_hex": self.identity.public_key_hex,
             },
             "last_heartbeat_time": self.last_heartbeat_time,
             "messages_received_count": self.messages_received_count,

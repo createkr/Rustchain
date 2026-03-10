@@ -13,14 +13,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 # Add integrations to path
-sys.path.insert(0, str(Path(__file__).parent.parent / "integrations" / "beacon_crewai"))
+sys.path.insert(0, str(Path(__file__).parent.parent / "integrations"))
 
 
 class TestBeaconConfig:
     """Test BeaconConfig dataclass."""
 
     def test_default_values(self):
-        from beacon_langgraph import BeaconConfig
+        from beacon_crewai.beacon_langgraph import BeaconConfig
 
         config = BeaconConfig(agent_id="test-agent")
 
@@ -33,7 +33,7 @@ class TestBeaconConfig:
         assert config.heartbeat_interval_seconds == 60
 
     def test_custom_values(self):
-        from beacon_langgraph import BeaconConfig
+        from beacon_crewai.beacon_langgraph import BeaconConfig
 
         config = BeaconConfig(
             agent_id="custom-agent",
@@ -55,7 +55,7 @@ class TestModuleImports:
 
     def test_beacon_langgraph_imports(self):
         """Test that beacon_langgraph module can be imported."""
-        import beacon_langgraph
+        from beacon_crewai import beacon_langgraph
 
         assert hasattr(beacon_langgraph, "BeaconConfig")
         assert hasattr(beacon_langgraph, "BeaconNode")
@@ -71,14 +71,14 @@ class TestLangGraphAvailability:
 
     def test_langgraph_available_flag(self):
         """Test LANGGRAPH_AVAILABLE flag reflects actual state."""
-        import beacon_langgraph
+        from beacon_crewai import beacon_langgraph
 
         # Flag should be boolean
         assert isinstance(beacon_langgraph.LANGGRAPH_AVAILABLE, bool)
 
     def test_langchain_available_flag(self):
         """Test LANGCHAIN_AVAILABLE flag reflects actual state."""
-        import beacon_langgraph
+        from beacon_crewai import beacon_langgraph
 
         # Flag should be boolean
         assert isinstance(beacon_langgraph.LANGCHAIN_AVAILABLE, bool)
@@ -89,7 +89,7 @@ class TestBeaconNodeStructure:
 
     def test_beacon_node_has_required_methods(self):
         """Test that BeaconNode has all required methods."""
-        import beacon_langgraph
+        from beacon_crewai import beacon_langgraph
 
         methods = [
             "send_heartbeat_node",
@@ -109,8 +109,8 @@ class TestCreateBeaconGraph:
 
     def test_raises_without_langgraph(self):
         """Test that create_beacon_graph raises when LangGraph unavailable."""
-        with patch("beacon_langgraph.LANGGRAPH_AVAILABLE", False):
-            from beacon_langgraph import create_beacon_graph
+        with patch("beacon_crewai.beacon_langgraph.LANGGRAPH_AVAILABLE", False):
+            from beacon_crewai.beacon_langgraph import create_beacon_graph
 
             with pytest.raises(ImportError, match="langgraph package not installed"):
                 create_beacon_graph(agent_id="test")
@@ -121,8 +121,8 @@ class TestCreateBeaconTools:
 
     def test_returns_empty_without_langchain(self):
         """Test that create_beacon_tools returns empty list without LangChain."""
-        with patch("beacon_langgraph.LANGCHAIN_AVAILABLE", False):
-            from beacon_langgraph import create_beacon_tools
+        with patch("beacon_crewai.beacon_langgraph.LANGCHAIN_AVAILABLE", False):
+            from beacon_crewai.beacon_langgraph import create_beacon_tools
 
             tools = create_beacon_tools()
             assert tools == []
@@ -133,7 +133,7 @@ class TestBeaconGraphState:
 
     def test_state_is_typed_dict(self):
         """Test that BeaconGraphState is a TypedDict."""
-        from beacon_langgraph import BeaconGraphState
+        from beacon_crewai.beacon_langgraph import BeaconGraphState
 
         # TypedDict should have the right metaclass
         assert isinstance(BeaconGraphState, type)
@@ -143,10 +143,10 @@ class TestBeaconGraphState:
 
     def test_state_has_expected_keys(self):
         """Test that BeaconGraphState has expected keys."""
-        from beacon_langgraph import BeaconGraphState
+        from beacon_crewai.beacon_langgraph import BeaconGraphState
 
         annotations = BeaconGraphState.__annotations__
-        
+
         # Check for some expected keys
         expected_keys = ["action", "messages", "identity", "error"]
         found_keys = [k for k in expected_keys if k in annotations]
@@ -199,7 +199,7 @@ class TestNodeInitialization:
 
     def test_node_requires_config(self):
         """Test that BeaconNode requires a config."""
-        import beacon_langgraph
+        from beacon_crewai import beacon_langgraph
 
         # Config is required
         with pytest.raises(TypeError):
@@ -212,11 +212,10 @@ class TestCrewAIIntegration:
     def test_crewai_available_flag_in_langgraph(self):
         """Test that LangGraph module also checks CrewAI availability."""
         # Both modules should have CREWAI_AVAILABLE
-        import beacon_crewai
-        import beacon_langgraph
+        from beacon_crewai import beacon_crewai
+        from beacon_crewai import beacon_langgraph
 
         assert isinstance(beacon_crewai.CREWAI_AVAILABLE, bool)
-        # LangGraph module doesn't directly use CrewAI, but should be aware
 
 
 if __name__ == "__main__":

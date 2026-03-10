@@ -13,14 +13,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 # Add integrations to path
-sys.path.insert(0, str(Path(__file__).parent.parent / "integrations" / "beacon_crewai"))
+sys.path.insert(0, str(Path(__file__).parent.parent / "integrations"))
 
 
 class TestBeaconConfig:
     """Test BeaconConfig dataclass."""
 
     def test_default_values(self):
-        from beacon_crewai import BeaconConfig
+        from beacon_crewai.beacon_crewai import BeaconConfig
 
         config = BeaconConfig(agent_id="test-agent")
 
@@ -34,7 +34,7 @@ class TestBeaconConfig:
         assert config.known_keys is None
 
     def test_custom_values(self):
-        from beacon_crewai import BeaconConfig
+        from beacon_crewai.beacon_crewai import BeaconConfig
 
         config = BeaconConfig(
             agent_id="custom-agent",
@@ -60,7 +60,7 @@ class TestModuleImports:
 
     def test_beacon_crewai_imports(self):
         """Test that beacon_crewai module can be imported."""
-        import beacon_crewai
+        from beacon_crewai import beacon_crewai
 
         assert hasattr(beacon_crewai, "BeaconConfig")
         assert hasattr(beacon_crewai, "BeaconAgent")
@@ -69,7 +69,7 @@ class TestModuleImports:
 
     def test_beacon_langgraph_imports(self):
         """Test that beacon_langgraph module can be imported."""
-        import beacon_langgraph
+        from beacon_crewai import beacon_langgraph
 
         assert hasattr(beacon_langgraph, "BeaconConfig")
         assert hasattr(beacon_langgraph, "BeaconNode")
@@ -84,14 +84,14 @@ class TestCrewAIAvailability:
 
     def test_crewai_available_flag(self):
         """Test CREWAI_AVAILABLE flag reflects actual state."""
-        import beacon_crewai
+        from beacon_crewai import beacon_crewai
 
         # Flag should be boolean
         assert isinstance(beacon_crewai.CREWAI_AVAILABLE, bool)
 
     def test_langgraph_available_flag(self):
         """Test LANGGRAPH_AVAILABLE flag reflects actual state."""
-        import beacon_langgraph
+        from beacon_crewai import beacon_langgraph
 
         # Flag should be boolean
         assert isinstance(beacon_langgraph.LANGGRAPH_AVAILABLE, bool)
@@ -102,7 +102,7 @@ class TestBeaconAgentStructure:
 
     def test_beacon_agent_has_required_methods(self):
         """Test that BeaconAgent has all required methods."""
-        import beacon_crewai
+        from beacon_crewai import beacon_crewai
 
         methods = [
             "create_crewai_agent",
@@ -121,7 +121,7 @@ class TestBeaconAgentStructure:
 
     def test_beacon_node_has_required_methods(self):
         """Test that BeaconNode has all required methods."""
-        import beacon_langgraph
+        from beacon_crewai import beacon_langgraph
 
         methods = [
             "send_heartbeat_node",
@@ -141,8 +141,8 @@ class TestCreateBeaconCrew:
 
     def test_raises_without_crewai(self):
         """Test that create_beacon_crew raises when CrewAI unavailable."""
-        with patch("beacon_crewai.CREWAI_AVAILABLE", False):
-            from beacon_crewai import create_beacon_crew
+        with patch("beacon_crewai.beacon_crewai.CREWAI_AVAILABLE", False):
+            from beacon_crewai.beacon_crewai import create_beacon_crew
 
             with pytest.raises(ImportError, match="crewai package not installed"):
                 create_beacon_crew(
@@ -157,8 +157,8 @@ class TestCreateBeaconGraph:
 
     def test_raises_without_langgraph(self):
         """Test that create_beacon_graph raises when LangGraph unavailable."""
-        with patch("beacon_langgraph.LANGGRAPH_AVAILABLE", False):
-            from beacon_langgraph import create_beacon_graph
+        with patch("beacon_crewai.beacon_langgraph.LANGGRAPH_AVAILABLE", False):
+            from beacon_crewai.beacon_langgraph import create_beacon_graph
 
             with pytest.raises(ImportError, match="langgraph package not installed"):
                 create_beacon_graph(agent_id="test")
@@ -169,8 +169,8 @@ class TestBeaconTools:
 
     def test_get_beacon_tools_empty_without_crewai(self):
         """Test that get_beacon_tools returns empty list without CrewAI."""
-        with patch("beacon_crewai.CREWAI_AVAILABLE", False):
-            from beacon_crewai import BeaconAgent, BeaconConfig
+        with patch("beacon_crewai.beacon_crewai.CREWAI_AVAILABLE", False):
+            from beacon_crewai.beacon_crewai import BeaconAgent, BeaconConfig
 
             config = BeaconConfig(agent_id="test-agent")
             # Can't fully instantiate without beacon_skill, but test the method
@@ -178,8 +178,8 @@ class TestBeaconTools:
 
     def test_create_beacon_tools_empty_without_langchain(self):
         """Test that create_beacon_tools returns empty list without LangChain."""
-        with patch("beacon_langgraph.LANGCHAIN_AVAILABLE", False):
-            from beacon_langgraph import create_beacon_tools
+        with patch("beacon_crewai.beacon_langgraph.LANGCHAIN_AVAILABLE", False):
+            from beacon_crewai.beacon_langgraph import create_beacon_tools
 
             tools = create_beacon_tools()
             assert tools == []
@@ -190,7 +190,7 @@ class TestBeaconGraphState:
 
     def test_state_is_typed_dict(self):
         """Test that BeaconGraphState is a TypedDict."""
-        from beacon_langgraph import BeaconGraphState
+        from beacon_crewai.beacon_langgraph import BeaconGraphState
         from typing import _TypedDictMeta
 
         # TypedDict should have the right metaclass
@@ -203,14 +203,14 @@ class TestBeaconGraphState:
 class TestBehavioralWithMocks:
     """Behavioral tests mocking beacon_skill dependencies."""
 
-    @patch("beacon_crewai.ContractManager")
-    @patch("beacon_crewai.AgentIdentity")
-    @patch("beacon_crewai.HeartbeatManager")
-    @patch("beacon_crewai.udp_send")
-    @patch("beacon_crewai.encode_envelope")
+    @patch("beacon_crewai.beacon_crewai.ContractManager")
+    @patch("beacon_crewai.beacon_crewai.AgentIdentity")
+    @patch("beacon_crewai.beacon_crewai.HeartbeatManager")
+    @patch("beacon_crewai.beacon_crewai.udp_send")
+    @patch("beacon_crewai.beacon_crewai.encode_envelope")
     def test_send_heartbeat_sends_udp(self, mock_encode, mock_udp_send, mock_hb_mgr, mock_identity, mock_contract_mgr):
         """Test send_heartbeat() sends UDP packet with encoded envelope."""
-        from beacon_crewai import BeaconAgent, BeaconConfig
+        from beacon_crewai.beacon_crewai import BeaconAgent, BeaconConfig
 
         # Setup mocks
         mock_identity.generate.return_value.agent_id = "test-agent"
@@ -227,22 +227,22 @@ class TestBehavioralWithMocks:
             "127.0.0.1", 38400, b"encoded_envelope_test_string", broadcast=False
         )
 
-    @patch("beacon_crewai.ContractManager")
-    @patch("beacon_crewai.AgentIdentity")
-    @patch("beacon_crewai.HeartbeatManager")
-    @patch("beacon_crewai.decode_envelopes")
-    @patch("beacon_crewai.verify_envelope")
+    @patch("beacon_crewai.beacon_crewai.ContractManager")
+    @patch("beacon_crewai.beacon_crewai.AgentIdentity")
+    @patch("beacon_crewai.beacon_crewai.HeartbeatManager")
+    @patch("beacon_crewai.beacon_crewai.decode_envelopes")
+    @patch("beacon_crewai.beacon_crewai.verify_envelope")
     def test_verify_envelope_returns_valid_result(
         self, mock_verify, mock_decode, mock_hb_mgr, mock_identity, mock_contract_mgr
     ):
         """Test verify_envelope() returns verification result."""
-        from beacon_crewai import BeaconAgent, BeaconConfig
+        from beacon_crewai.beacon_crewai import BeaconAgent, BeaconConfig
 
         # Setup mocks
         mock_identity.generate.return_value.agent_id = "test-agent"
-        mock_identity.generate.return_value.pubkey = b"testpubkey"
-        mock_decode.return_value = ["envelope1"]
-        mock_verify.return_value = {"agent_id": "sender-agent", "pubkey": b"senderpubkey"}
+        mock_identity.generate.return_value.public_key_hex = "746573747075626b6579"
+        mock_decode.return_value = [{"agent_id": "sender-agent", "pubkey": "senderpubkey"}]
+        mock_verify.return_value = True  # verify_envelope returns bool
 
         config = BeaconConfig(agent_id="test-agent")
         agent = BeaconAgent(config=config)
@@ -252,17 +252,17 @@ class TestBehavioralWithMocks:
         assert result["valid"] is True
         assert result["agent_id"] == "sender-agent"
         mock_decode.assert_called_once_with("test_envelope_string")
-        mock_verify.assert_called_once_with("envelope1", known_keys=None)
+        mock_verify.assert_called_once_with({"agent_id": "sender-agent", "pubkey": "senderpubkey"}, known_keys=None)
 
-    @patch("beacon_crewai.ContractManager")
-    @patch("beacon_crewai.AgentIdentity")
-    @patch("beacon_crewai.HeartbeatManager")
-    @patch("beacon_crewai.decode_envelopes")
+    @patch("beacon_crewai.beacon_crewai.ContractManager")
+    @patch("beacon_crewai.beacon_crewai.AgentIdentity")
+    @patch("beacon_crewai.beacon_crewai.HeartbeatManager")
+    @patch("beacon_crewai.beacon_crewai.decode_envelopes")
     def test_verify_envelope_invalid_envelope(
         self, mock_decode, mock_hb_mgr, mock_identity, mock_contract_mgr
     ):
         """Test verify_envelope() handles invalid envelope gracefully."""
-        from beacon_crewai import BeaconAgent, BeaconConfig
+        from beacon_crewai.beacon_crewai import BeaconAgent, BeaconConfig
 
         # Setup mocks
         mock_identity.generate.return_value.agent_id = "test-agent"

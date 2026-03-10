@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from beacon_config import BeaconConfig
+from .beacon_config import BeaconConfig
 
 # Optional beacon_skill import (graceful degradation)
 try:
@@ -109,7 +109,7 @@ class BeaconAgent:
         identity = AgentIdentity.generate(use_mnemonic=config.use_mnemonic)
         self.state = BeaconState(
             identity=identity,
-            heartbeat_manager=HeartbeatManager(data_dir=str(data_dir / "heartbeats")),
+            heartbeat_manager=HeartbeatManager(data_dir=data_dir / "heartbeats"),
             contract_manager=ContractManager(data_dir=str(data_dir / "contracts")),
         )
 
@@ -145,7 +145,8 @@ class BeaconAgent:
         if not CREWAI_AVAILABLE:
             return []
 
-        from crewai_tools import tool
+        # Use langchain_core.tools for creating tools compatible with CrewAI
+        from langchain_core.tools import tool
 
         @tool("send_beacon_heartbeat")
         def send_heartbeat(status: str = "alive", health_data: Optional[str] = None) -> str:
@@ -346,11 +347,13 @@ class BeaconAgent:
         if not envelopes:
             return {"valid": False, "error": "Failed to decode envelope"}
 
-        result = verify_envelope(envelopes[0], known_keys=self.config.known_keys)
+        envelope_dict = envelopes[0]
+        is_valid = verify_envelope(envelope_dict, known_keys=self.config.known_keys)
+        
         return {
-            "valid": result is not None,
-            "agent_id": result.get("agent_id") if result else None,
-            "pubkey": result.get("pubkey") if result else None,
+            "valid": is_valid,
+            "agent_id": envelope_dict.get("agent_id") if is_valid else None,
+            "pubkey": envelope_dict.get("pubkey") if is_valid else None,
         }
 
     def list_contract(
@@ -396,8 +399,8 @@ class BeaconAgent:
         """
         return {
             "agent_id": self.state.identity.agent_id,
-            "pubkey": self.state.identity.pubkey,
-            "pubkey_hex": self.state.identity.pubkey.hex(),
+            "pubkey": bytes.fromhex(self.state.identity.public_key_hex),
+            "pubkey_hex": self.state.identity.public_key_hex,
         }
 
     def set_message_callback(self, callback: Callable[[Dict[str, Any]], None]) -> None:
