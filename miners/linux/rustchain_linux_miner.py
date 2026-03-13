@@ -17,7 +17,14 @@ except ImportError:
     FINGERPRINT_AVAILABLE = False
     print("[WARN] fingerprint_checks.py not found - fingerprint attestation disabled")
 
-NODE_URL = "https://50.28.86.131"  # Use HTTPS via nginx
+# Import Warthog dual-mining sidecar
+try:
+    from warthog_sidecar import WarthogSidecar
+    WARTHOG_AVAILABLE = True
+except ImportError:
+    WARTHOG_AVAILABLE = False
+
+NODE_URL = "https://rustchain.org"  # Use HTTPS via nginx
 BLOCK_TIME = 600  # 10 minutes
 
 def get_linux_serial():
@@ -47,7 +54,8 @@ def get_linux_serial():
     return None
 
 class LocalMiner:
-    def __init__(self, wallet=None):
+    def __init__(self, wallet=None, wart_address=None, wart_pool=None,
+                 bzminer_path=None, manage_bzminer=False):
         self.node_url = NODE_URL
         self.wallet = wallet or self._gen_wallet()
         self.hw_info = {}
@@ -57,10 +65,22 @@ class LocalMiner:
         self.fingerprint_data = {}
         self.fingerprint_passed = False
 
+        # Warthog dual-mining sidecar
+        self.warthog = None
+        if WARTHOG_AVAILABLE and wart_address:
+            self.warthog = WarthogSidecar(
+                wart_address=wart_address,
+                pool_url=wart_pool,
+                bzminer_path=bzminer_path,
+                manage_bzminer=manage_bzminer,
+            )
+
         self.serial = get_linux_serial()
         print("="*70)
         print("RustChain Local Miner - HP Victus Ryzen 5 8645HS")
         print("RIP-PoA Hardware Fingerprint + Serial Binding v2.0")
+        if self.warthog:
+            print("+ Warthog Dual-Mining Sidecar ACTIVE")
         print("="*70)
         print(f"Node: {self.node_url}")
         print(f"Wallet: {self.wallet}")
@@ -255,7 +275,9 @@ class LocalMiner:
                 "hostname": self.hw_info["hostname"]
             },
             # RIP-PoA hardware fingerprint attestation
-            "fingerprint": self.fingerprint_data
+            "fingerprint": self.fingerprint_data,
+            # Warthog dual-mining proof (None if sidecar not active)
+            "warthog": self.warthog.collect_proof() if self.warthog else None
         }
 
         try:
@@ -379,6 +401,43 @@ class LocalMiner:
             pass
         return 0
 
+
+    def dry_run(self):
+        """Preview miner setup without attesting/enrolling/mining."""
+        print("\n[DRY-RUN] RustChain Linux Miner preflight")
+        print("[DRY-RUN] No mining or network state will be modified")
+
+        self._get_hw_info()
+        print(f"[DRY-RUN] Node URL: {self.node_url}")
+        print(f"[DRY-RUN] Wallet: {self.wallet}")
+        print(f"[DRY-RUN] Hostname: {self.hw_info.get('hostname')}")
+        print(f"[DRY-RUN] CPU: {self.hw_info.get('cpu')}")
+        print(f"[DRY-RUN] Cores: {self.hw_info.get('cores')}")
+        print(f"[DRY-RUN] Memory(GB): {self.hw_info.get('memory_gb')}")
+        print(f"[DRY-RUN] MAC count: {len(self.hw_info.get('macs', []))}")
+        print(f"[DRY-RUN] Serial present: {'yes' if self.hw_info.get('serial') else 'no'}")
+
+        if FINGERPRINT_AVAILABLE:
+            if not self.fingerprint_data:
+                self._run_fingerprint_checks()
+            print(f"[DRY-RUN] Fingerprint checks available: yes")
+            print(f"[DRY-RUN] Fingerprint pass status: {self.fingerprint_passed}")
+        else:
+            print("[DRY-RUN] Fingerprint checks available: no")
+
+        # Optional health probe (read-only)
+        try:
+            r = requests.get(f"{self.node_url}/health", timeout=8, verify=False)
+            print(f"[DRY-RUN] Health probe: HTTP {r.status_code}")
+            if r.ok:
+                data = r.json()
+                print(f"[DRY-RUN] Node version: {data.get('version', 'n/a')}")
+        except Exception as e:
+            print(f"[DRY-RUN] Health probe failed: {e}")
+
+        print("[DRY-RUN] Next real steps would be: attest -> enroll -> mine loop")
+        return True
+
     def mine(self):
         """Start mining"""
         print(f"\n⛏️  Starting mining...")
@@ -421,10 +480,25 @@ class LocalMiner:
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--version", "-v", action="version", version="clawrtc 1.5.0")
+    parser = argparse.ArgumentParser(description="RustChain Miner with optional Warthog dual-mining")
+    parser.add_argument("--version", "-v", action="version", version="RustChain Miner v2.2.1-rip200")
     parser.add_argument("--wallet", help="Wallet address")
+    # Warthog dual-mining options
+    parser.add_argument("--wart-address", help="Warthog wallet address (wart1q...) to enable dual-mining")
+    parser.add_argument("--wart-pool", help="Warthog mining pool API URL")
+    parser.add_argument("--bzminer-path", help="Path to BzMiner binary")
+    parser.add_argument("--manage-bzminer", action="store_true", help="Auto-start/stop BzMiner")
+    parser.add_argument("--dry-run", action="store_true", help="Run preflight checks only; do not start mining")
     args = parser.parse_args()
 
-    miner = LocalMiner(wallet=args.wallet)
-    miner.mine()
+    miner = LocalMiner(
+        wallet=args.wallet,
+        wart_address=args.wart_address,
+        wart_pool=args.wart_pool,
+        bzminer_path=args.bzminer_path,
+        manage_bzminer=args.manage_bzminer,
+    )
+    if args.dry_run:
+        miner.dry_run()
+    else:
+        miner.mine()

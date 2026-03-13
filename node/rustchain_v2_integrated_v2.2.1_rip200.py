@@ -3,12 +3,11 @@
 RustChain v2 - Integrated Server
 Includes RIP-0005 (Epoch Rewards), RIP-0008 (Withdrawals), RIP-0009 (Finality)
 """
-import os, time, json, secrets, hashlib, hmac, sqlite3, base64, struct, uuid, glob, logging, sys, binascii, math
+import os, time, json, secrets, hashlib, hmac, sqlite3, base64, struct, uuid, glob, logging, sys, binascii, math, re, statistics
 import ipaddress
-from urllib.parse import urlparse, quote
-from urllib.request import Request, urlopen
-from urllib.error import URLError, HTTPError
-from flask import Flask, request, jsonify, g, send_from_directory, send_file, abort
+from urllib.parse import urlparse
+from flask import Flask, request, jsonify, g, send_from_directory, send_file, abort, render_template_string, redirect
+from beacon_anchor import init_beacon_table, store_envelope, compute_beacon_digest, get_recent_envelopes, VALID_KINDS
 try:
     # Deployment compatibility: production may run this file as a single script.
     from payout_preflight import validate_wallet_transfer_admin, validate_wallet_transfer_signed
@@ -41,25 +40,22 @@ from datetime import datetime
 from typing import Dict, Optional, Tuple
 from hashlib import blake2b
 
+# RIP-201: Fleet Detection Immune System
+try:
+    from fleet_immune_system import (
+        record_fleet_signals, calculate_immune_weights,
+        register_fleet_endpoints, ensure_schema as ensure_fleet_schema,
+        get_fleet_report
+    )
+    HAVE_FLEET_IMMUNE = True
+    print("[RIP-201] Fleet immune system loaded")
+except Exception as _e:
+    print(f"[RIP-201] Fleet immune system not available: {_e}")
+    HAVE_FLEET_IMMUNE = False
+
 # Ed25519 signature verification
 TESTNET_ALLOW_INLINE_PUBKEY = False  # PRODUCTION: Disabled
 TESTNET_ALLOW_MOCK_SIG = False  # PRODUCTION: Disabled
-
-
-def _runtime_env_name() -> str:
-    return (os.getenv("RC_RUNTIME_ENV") or os.getenv("RUSTCHAIN_ENV") or "").strip().lower()
-
-
-def enforce_mock_signature_runtime_guard() -> None:
-    """Fail closed if mock signature mode is enabled outside test runtime."""
-    if not TESTNET_ALLOW_MOCK_SIG:
-        return
-    if _runtime_env_name() in {"test", "testing", "ci"}:
-        return
-    raise RuntimeError(
-        "Refusing to start with TESTNET_ALLOW_MOCK_SIG enabled outside test runtime "
-        "(set RC_RUNTIME_ENV=test only for tests)."
-    )
 
 try:
     from nacl.signing import VerifyKey
@@ -99,125 +95,235 @@ except ImportError as e:
     HW_PROOF_AVAILABLE = False
     print(f"[INIT] Hardware proof module not found: {e}")
 
+# Warthog dual-mining verification
+try:
+    from warthog_verification import (
+        verify_warthog_proof, record_warthog_proof,
+        get_warthog_bonus, init_warthog_tables
+    )
+    HAVE_WARTHOG = True
+    print("[INIT] [OK] Warthog dual-mining verification loaded")
+except ImportError as _e:
+    HAVE_WARTHOG = False
+    print(f"[INIT] Warthog verification not available: {_e}")
+
+# RIP-305: Cross-Chain Airdrop (standalone module)
+try:
+    from airdrop_v2 import AirdropV2, init_airdrop_routes
+    HAVE_AIRDROP = True
+    print("[RIP-305] Airdrop V2 module loaded")
+except ImportError as _e:
+    HAVE_AIRDROP = False
+    print(f"[RIP-305] Airdrop V2 module not available: {_e}")
+
+# RIP-0305 Track C: Bridge API + Lock Ledger
+try:
+    from bridge_api import register_bridge_routes, init_bridge_schema
+    from lock_ledger import register_lock_ledger_routes, init_lock_ledger_schema
+    HAVE_BRIDGE = True
+    print("[RIP-0305 Track C] Bridge API + Lock Ledger modules loaded")
+except ImportError as _e:
+    HAVE_BRIDGE = False
+    print(f"[RIP-0305 Track C] Bridge modules not available: {_e}")
+
+# BoTTube RSS/Atom Feed Support (Issue #759)
+try:
+    from bottube_feed_routes import init_feed_routes
+    HAVE_BOTTUBE_FEED = True
+    print("[BoTTube Feed] RSS/Atom feed module loaded")
+except ImportError as _e:
+    HAVE_BOTTUBE_FEED = False
+    print(f"[BoTTube Feed] Feed module not available: {_e}")
+
 app = Flask(__name__)
 # Supports running from repo `node/` dir or a flat deployment directory (e.g. /root/rustchain).
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(_BASE_DIR, "..")) if os.path.basename(_BASE_DIR) == "node" else _BASE_DIR
 LIGHTCLIENT_DIR = os.path.join(REPO_ROOT, "web", "light-client")
 MUSEUM_DIR = os.path.join(REPO_ROOT, "web", "museum")
-
-HUNTER_BADGE_RAW_URLS = {
-    "topHunter": "https://raw.githubusercontent.com/Scottcjn/rustchain-bounties/main/badges/top-hunter.json",
-    "totalXp": "https://raw.githubusercontent.com/Scottcjn/rustchain-bounties/main/badges/hunter-stats.json",
-    "activeHunters": "https://raw.githubusercontent.com/Scottcjn/rustchain-bounties/main/badges/active-hunters.json",
-    "legendaryHunters": "https://raw.githubusercontent.com/Scottcjn/rustchain-bounties/main/badges/legendary-hunters.json",
-    "updatedAt": "https://raw.githubusercontent.com/Scottcjn/rustchain-bounties/main/badges/updated-at.json",
-}
-_HUNTER_BADGE_CACHE = {"ts": 0, "data": None}
-_HUNTER_BADGE_TTL_S = int(os.environ.get("HUNTER_BADGE_CACHE_TTL", "300"))
+HOF_DIR = os.path.join(REPO_ROOT, "web", "hall-of-fame")
+DASHBOARD_DIR = os.path.join(REPO_ROOT, "tools", "miner_dashboard")
+EXPLORER_DIR = os.path.join(REPO_ROOT, "tools", "explorer")
 
 
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return default
+def _attest_mapping(value):
+    """Return a dict-like payload section or an empty mapping."""
+    return value if isinstance(value, dict) else {}
 
 
-ATTEST_NONCE_SKEW_SECONDS = _env_int("RC_ATTEST_NONCE_SKEW_SECONDS", 60)
-ATTEST_NONCE_TTL_SECONDS = _env_int("RC_ATTEST_NONCE_TTL_SECONDS", 3600)
-ATTEST_CHALLENGE_TTL_SECONDS = _env_int("RC_ATTEST_CHALLENGE_TTL_SECONDS", 300)
-
-# ----------------------------------------------------------------------------
-# Trusted proxy handling
-#
-# SECURITY: never trust X-Forwarded-For unless the request came from a trusted
-# reverse proxy. This matters because we use client IP for logging, rate limits,
-# and (critically) hardware binding anti-multiwallet logic.
-#
-# Configure via env:
-#   RC_TRUSTED_PROXIES="127.0.0.1,::1,10.0.0.0/8"
-# ----------------------------------------------------------------------------
-
-def _parse_trusted_proxies() -> Tuple[set, list]:
-    raw = (os.environ.get("RC_TRUSTED_PROXIES", "") or "127.0.0.1,::1").strip()
-    ips = set()
-    nets = []
-    for item in [x.strip() for x in raw.split(",") if x.strip()]:
-        try:
-            if "/" in item:
-                nets.append(ipaddress.ip_network(item, strict=False))
-            else:
-                ips.add(item)
-        except Exception:
-            continue
-    return ips, nets
+_ATTEST_MINER_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
 
-_TRUSTED_PROXY_IPS, _TRUSTED_PROXY_NETS = _parse_trusted_proxies()
+def _attest_text(value):
+    """Accept only non-empty text values from untrusted attestation input."""
+    if isinstance(value, str):
+        value = value.strip()
+        if value:
+            return value
+    return None
 
 
-def _is_trusted_proxy_ip(ip_text: str) -> bool:
-    """Return True if an IP belongs to configured trusted proxies."""
-    if not ip_text:
+def _attest_valid_miner(value):
+    """Accept only bounded miner identifiers with a conservative character set."""
+    text = _attest_text(value)
+    if text and _ATTEST_MINER_RE.fullmatch(text):
+        return text
+    return None
+
+
+def _attest_field_error(code, message, status=400):
+    """Build a consistent error payload for malformed attestation inputs."""
+    return jsonify({
+        "ok": False,
+        "error": code.lower(),
+        "message": message,
+        "code": code,
+    }), status
+
+
+def _attest_is_valid_positive_int(value, max_value=4096):
+    """Validate positive integer-like input without silently coercing hostile shapes."""
+    if isinstance(value, bool):
         return False
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            return False
     try:
-        ip_obj = ipaddress.ip_address(ip_text)
-        if ip_text in _TRUSTED_PROXY_IPS:
-            return True
-        for net in _TRUSTED_PROXY_NETS:
-            if ip_obj in net:
-                return True
+        coerced = int(value)
+    except (TypeError, ValueError, OverflowError):
         return False
-    except Exception:
-        return ip_text in _TRUSTED_PROXY_IPS
+    return 1 <= coerced <= max_value
 
 
 def client_ip_from_request(req) -> str:
-    remote = (req.remote_addr or "").strip()
-    if not remote:
-        return ""
-
-    if not _is_trusted_proxy_ip(remote):
-        return remote
-
-    xff = (req.headers.get("X-Forwarded-For", "") or "").strip()
-    if not xff:
-        return remote
-
-    # Walk right-to-left to resist client-controlled header injection.
-    # Proxies append their observed client to the right side.
-    hops = [h.strip() for h in xff.split(",") if h.strip()]
-    hops.append(remote)
-    for hop in reversed(hops):
-        try:
-            ipaddress.ip_address(hop)
-        except Exception:
-            continue
-        if not _is_trusted_proxy_ip(hop):
-            return hop
-    return remote
+    """Return trusted client IP, honoring proxy headers only for allowlisted peers."""
+    remote_addr = _normalize_client_ip(getattr(req, "remote_addr", ""))
+    forwarded_ip = _normalize_client_ip(req.headers.get("X-Real-IP", ""))
+    if forwarded_ip and _is_trusted_proxy(remote_addr):
+        return forwarded_ip
+    return remote_addr
 
 
-def _parse_int_query_arg(name: str, default: int, min_value: int | None = None, max_value: int | None = None):
-    raw_value = request.args.get(name)
-    if raw_value is None or str(raw_value).strip() == "":
-        value = default
-    else:
-        try:
-            value = int(raw_value)
-        except (TypeError, ValueError):
-            return None, f"{name} must be an integer"
+def _attest_positive_int(value, default=1):
+    """Coerce untrusted integer-like values to a safe positive integer."""
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError):
+        return default
+    return coerced if coerced > 0 else default
 
-    if min_value is not None and value < min_value:
-        value = min_value
-    if max_value is not None and value > max_value:
-        value = max_value
-    return value, None
 
+def _attest_string_list(value):
+    """Coerce a list-like field into a list of non-empty strings."""
+    if not isinstance(value, list):
+        return []
+    items = []
+    for item in value:
+        text = _attest_text(item)
+        if text:
+            items.append(text)
+    return items
+
+
+def _validate_attestation_payload_shape(data):
+    """Reject malformed attestation payload shapes before normalization."""
+    for field_name, code in (
+        ("device", "INVALID_DEVICE"),
+        ("signals", "INVALID_SIGNALS"),
+        ("report", "INVALID_REPORT"),
+        ("fingerprint", "INVALID_FINGERPRINT"),
+    ):
+        if field_name in data and data[field_name] is not None and not isinstance(data[field_name], dict):
+            return _attest_field_error(code, f"Field '{field_name}' must be a JSON object")
+
+    for field_name in ("miner", "miner_id"):
+        if field_name in data and data[field_name] is not None and not isinstance(data[field_name], str):
+            return _attest_field_error("INVALID_MINER", f"Field '{field_name}' must be a non-empty string")
+
+    miner = _attest_valid_miner(data.get("miner")) or _attest_valid_miner(data.get("miner_id"))
+    if not miner and not (_attest_text(data.get("miner")) or _attest_text(data.get("miner_id"))):
+        return _attest_field_error(
+            "MISSING_MINER",
+            "Field 'miner' or 'miner_id' must be a non-empty identifier using only letters, numbers, '.', '_', ':' or '-'",
+        )
+    if not miner:
+        return _attest_field_error(
+            "INVALID_MINER",
+            "Field 'miner' or 'miner_id' must use only letters, numbers, '.', '_', ':' or '-' and be at most 128 characters",
+        )
+
+    device = data.get("device")
+    if isinstance(device, dict):
+        if "cores" in device and not _attest_is_valid_positive_int(device.get("cores")):
+            return _attest_field_error("INVALID_DEVICE_CORES", "Field 'device.cores' must be a positive integer between 1 and 4096", status=422)
+        for field_name in ("device_family", "family", "device_arch", "arch", "device_model", "model", "cpu", "serial_number", "serial"):
+            if field_name in device and device[field_name] is not None and not isinstance(device[field_name], str):
+                return _attest_field_error("INVALID_DEVICE", f"Field 'device.{field_name}' must be a string")
+
+    signals = data.get("signals")
+    if isinstance(signals, dict):
+        if "macs" in signals:
+            macs = signals.get("macs")
+            if not isinstance(macs, list) or any(_attest_text(mac) is None for mac in macs):
+                return _attest_field_error("INVALID_SIGNALS_MACS", "Field 'signals.macs' must be a list of non-empty strings")
+        for field_name in ("hostname", "serial"):
+            if field_name in signals and signals[field_name] is not None and not isinstance(signals[field_name], str):
+                return _attest_field_error("INVALID_SIGNALS", f"Field 'signals.{field_name}' must be a string")
+
+    report = data.get("report")
+    if isinstance(report, dict):
+        for field_name in ("nonce", "commitment"):
+            if field_name in report and report[field_name] is not None and not isinstance(report[field_name], str):
+                return _attest_field_error("INVALID_REPORT", f"Field 'report.{field_name}' must be a string")
+
+    fingerprint = data.get("fingerprint")
+    if isinstance(fingerprint, dict) and "checks" in fingerprint and not isinstance(fingerprint.get("checks"), dict):
+        return _attest_field_error("INVALID_FINGERPRINT_CHECKS", "Field 'fingerprint.checks' must be a JSON object")
+
+    return None
+
+
+def _normalize_attestation_device(device):
+    """Shallow-normalize device metadata so malformed JSON shapes fail closed."""
+    raw = _attest_mapping(device)
+    normalized = {"cores": _attest_positive_int(raw.get("cores"), default=1)}
+    for field in (
+        "device_family",
+        "family",
+        "device_arch",
+        "arch",
+        "device_model",
+        "model",
+        "cpu",
+        "serial_number",
+        "serial",
+    ):
+        text = _attest_text(raw.get(field))
+        if text is not None:
+            normalized[field] = text
+    return normalized
+
+
+def _normalize_attestation_signals(signals):
+    """Shallow-normalize signal metadata used by attestation validation."""
+    raw = _attest_mapping(signals)
+    normalized = {"macs": _attest_string_list(raw.get("macs"))}
+    for field in ("hostname", "serial"):
+        text = _attest_text(raw.get(field))
+        if text is not None:
+            normalized[field] = text
+    return normalized
+
+
+def _normalize_attestation_report(report):
+    """Normalize report metadata used by challenge/ticket handling."""
+    raw = _attest_mapping(report)
+    normalized = {}
+    for field in ("nonce", "commitment"):
+        text = _attest_text(raw.get(field))
+        if text is not None:
+            normalized[field] = text
+    return normalized
 
 # Register Hall of Rust blueprint (tables initialized after DB_PATH is set)
 try:
@@ -227,10 +333,68 @@ try:
 except ImportError as e:
     print(f"[INIT] Hall of Rust not available: {e}")
 
+# x402 + Coinbase Wallet endpoints (swap-info, link-coinbase)
+try:
+    import rustchain_x402
+    rustchain_x402.init_app(app, "/root/rustchain/rustchain_v2.db")
+    print("[x402] RustChain wallet endpoints loaded")
+except Exception as e:
+    print(f"[WARN] rustchain_x402 not loaded: {e}")
+
 @app.before_request
 def _start_timer():
     g._ts = time.time()
     g.request_id = request.headers.get("X-Request-Id") or uuid.uuid4().hex
+
+def _normalize_client_ip(raw_value) -> str:
+    """Normalize a peer/header IP string down to the first address token."""
+    if raw_value is None:
+        return ""
+    if not isinstance(raw_value, str):
+        raw_value = str(raw_value)
+    value = raw_value.strip()
+    if not value:
+        return ""
+    if "," in value:
+        value = value.split(",")[0].strip()
+    return value
+
+
+def _trusted_proxy_networks():
+    """Return trusted reverse proxy networks from RC_TRUSTED_PROXY_IPS."""
+    raw = os.environ.get("RC_TRUSTED_PROXY_IPS", "127.0.0.1/32,::1/128")
+    networks = []
+    for token in raw.split(","):
+        entry = token.strip()
+        if not entry:
+            continue
+        try:
+            if "/" in entry:
+                networks.append(ipaddress.ip_network(entry, strict=False))
+            else:
+                parsed_ip = ipaddress.ip_address(entry)
+                suffix = "/32" if parsed_ip.version == 4 else "/128"
+                networks.append(ipaddress.ip_network(f"{entry}{suffix}", strict=False))
+        except ValueError:
+            continue
+    return networks
+
+
+def _is_trusted_proxy(remote_addr: str) -> bool:
+    """Whether the direct peer is an allowlisted reverse proxy."""
+    remote_ip = _normalize_client_ip(remote_addr)
+    if not remote_ip:
+        return False
+    try:
+        parsed_ip = ipaddress.ip_address(remote_ip)
+    except ValueError:
+        return False
+    return any(parsed_ip in network for network in _trusted_proxy_networks())
+
+
+def get_client_ip():
+    """Trusted client IP for rate limits and accounting surfaces."""
+    return client_ip_from_request(request)
 
 @app.after_request
 def _after(resp):
@@ -243,7 +407,7 @@ def _after(resp):
             "method": request.method,
             "path": request.path,
             "status": resp.status_code,
-            "ip": client_ip_from_request(request),
+            "ip": get_client_ip(),
             "dur_ms": int(dur * 1000),
         }
         log.info(json.dumps(rec, separators=(",", ":")))
@@ -292,26 +456,6 @@ OPENAPI = {
     ],
     "paths": {
         "/attest/challenge": {
-            "get": {
-                "summary": "Get hardware attestation challenge",
-                "responses": {
-                    "200": {
-                        "description": "Challenge issued",
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "nonce": {"type": "string"},
-                                        "expires_at": {"type": "integer"},
-                                        "server_time": {"type": "integer"}
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            },
             "post": {
                 "summary": "Get hardware attestation challenge",
                 "requestBody": {
@@ -684,11 +828,18 @@ GENESIS_TIMESTAMP = 1764706927  # First actual block (Dec 2, 2025)
 EPOCH_SLOTS = 144  # 24 hours at 10-min blocks
 PER_EPOCH_RTC = 1.5  # Total RTC distributed per epoch across all miners
 PER_BLOCK_RTC = PER_EPOCH_RTC / EPOCH_SLOTS  # ~0.0104 RTC per block
+TOTAL_SUPPLY_RTC = 8_388_608  # Exactly 2**23 — pure binary, immutable
+TOTAL_SUPPLY_URTC = int(TOTAL_SUPPLY_RTC * 1_000_000)  # 8,388,608,000,000 uRTC
 ENFORCE = False  # Start with enforcement off
 CHAIN_ID = "rustchain-mainnet-v2"
 MIN_WITHDRAWAL = 0.1  # RTC
 WITHDRAWAL_FEE = 0.01  # RTC
 MAX_DAILY_WITHDRAWAL = 1000.0  # RTC
+
+GOVERNANCE_ACTIVE_SECONDS = 7 * 24 * 60 * 60
+GOVERNANCE_MIN_PROPOSER_BALANCE_RTC = 10.0
+GOVERNANCE_ACTIVE_MINER_WINDOW_SECONDS = 3600
+
 
 # Prometheus metrics
 withdrawal_requests = Counter('rustchain_withdrawal_requests', 'Total withdrawal requests')
@@ -722,132 +873,51 @@ if HAVE_REWARDS:
         print(f"[REWARDS] Failed to register: {e}")
 
 
-def attest_ensure_tables(conn) -> None:
-    """Create attestation replay/challenge tables if they are missing."""
-    conn.execute("CREATE TABLE IF NOT EXISTS nonces (nonce TEXT PRIMARY KEY, expires_at INTEGER)")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS used_nonces (
-            nonce TEXT PRIMARY KEY,
-            miner_id TEXT,
-            first_seen INTEGER NOT NULL,
-            expires_at INTEGER NOT NULL
-        )
-        """
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_nonces_expires_at ON nonces(expires_at)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_used_nonces_expires_at ON used_nonces(expires_at)")
+    # RIP-201: Fleet immune system endpoints
+    if HAVE_FLEET_IMMUNE:
+        try:
+            register_fleet_endpoints(app, DB_PATH)
+            print("[RIP-201] Fleet immune endpoints registered")
+        except Exception as e:
+            print(f"[RIP-201] Failed to register fleet endpoints: {e}")
 
-
-def attest_cleanup_expired(conn, now_ts: Optional[int] = None) -> None:
-    now_ts = int(now_ts if now_ts is not None else time.time())
-    conn.execute("DELETE FROM nonces WHERE expires_at < ?", (now_ts,))
-    conn.execute("DELETE FROM used_nonces WHERE expires_at < ?", (now_ts,))
-
-
-def _coerce_unix_ts(raw_value) -> Optional[int]:
-    if raw_value is None:
-        return None
-    text = str(raw_value).strip()
-    if not text:
-        return None
-    if "." in text and text.replace(".", "", 1).isdigit():
-        text = text.split(".", 1)[0]
-    if not text.isdigit():
-        return None
-
-    ts = int(text)
-    if ts > 10_000_000_000:
-        ts //= 1000
-    if ts < 0:
-        return None
-    return ts
-
-
-def extract_attestation_timestamp(data: dict, report: dict, nonce: Optional[str]) -> Optional[int]:
-    for key in ("nonce_ts", "timestamp", "nonce_time", "nonce_timestamp"):
-        ts = _coerce_unix_ts(report.get(key))
-        if ts is not None:
-            return ts
-        ts = _coerce_unix_ts(data.get(key))
-        if ts is not None:
-            return ts
-
-    if not nonce:
-        return None
-
-    ts = _coerce_unix_ts(nonce)
-    if ts is not None:
-        return ts
-
-    for sep in (":", "|", "-", "_"):
-        if sep in nonce:
-            ts = _coerce_unix_ts(nonce.split(sep, 1)[0])
-            if ts is not None:
-                return ts
-    return None
-
-
-def attest_validate_challenge(conn, challenge: Optional[str], now_ts: Optional[int] = None):
-    if not challenge:
-        return True, None, None
-
-    now_ts = int(now_ts if now_ts is not None else time.time())
-    row = conn.execute("SELECT expires_at FROM nonces WHERE nonce = ?", (challenge,)).fetchone()
-    if not row:
-        return False, "challenge_invalid", "challenge nonce not found"
-
-    expires_at = int(row[0] or 0)
-    if expires_at < now_ts:
-        conn.execute("DELETE FROM nonces WHERE nonce = ?", (challenge,))
-        return False, "challenge_expired", "challenge nonce has expired"
-
-    conn.execute("DELETE FROM nonces WHERE nonce = ?", (challenge,))
-    return True, None, None
-
-
-def attest_validate_and_store_nonce(
-    conn,
-    miner: str,
-    nonce: Optional[str],
-    now_ts: Optional[int] = None,
-    nonce_ts: Optional[int] = None,
-    skew_seconds: int = ATTEST_NONCE_SKEW_SECONDS,
-    ttl_seconds: int = ATTEST_NONCE_TTL_SECONDS,
-):
-    if not nonce:
-        return True, None, None
-
-    now_ts = int(now_ts if now_ts is not None else time.time())
-    skew_seconds = max(0, int(skew_seconds))
-    ttl_seconds = max(1, int(ttl_seconds))
-
-    if nonce_ts is not None and abs(now_ts - int(nonce_ts)) > skew_seconds:
-        return False, "nonce_stale", f"nonce timestamp outside +/-{skew_seconds}s tolerance"
-
+# RIP-305: Airdrop V2 endpoints
+if HAVE_AIRDROP:
     try:
-        conn.execute(
-            "INSERT INTO used_nonces (nonce, miner_id, first_seen, expires_at) VALUES (?, ?, ?, ?)",
-            (nonce, miner, now_ts, now_ts + ttl_seconds),
-        )
-    except sqlite3.IntegrityError:
-        return False, "nonce_replay", "nonce has already been used"
+        airdrop_instance = AirdropV2()
+        init_airdrop_routes(app, airdrop_instance, DB_PATH)
+        print("[RIP-305] Airdrop V2 endpoints registered")
+    except Exception as e:
+        print(f"[RIP-305] Failed to register airdrop endpoints: {e}")
 
-    return True, None, None
+# RIP-0305 Track C: Bridge API + Lock Ledger endpoints
+if HAVE_BRIDGE:
+    try:
+        register_bridge_routes(app)
+        register_lock_ledger_routes(app)
+        print("[RIP-0305 Track C] Bridge API + Lock Ledger endpoints registered")
+    except Exception as e:
+        print(f"[RIP-0305 Track C] Failed to register bridge endpoints: {e}")
 
+# BoTTube RSS/Atom Feed endpoints (Issue #759)
+if HAVE_BOTTUBE_FEED:
+    try:
+        init_feed_routes(app)
+    except Exception as e:
+        print(f"[BoTTube Feed] Failed to register feed endpoints: {e}")
 
 def init_db():
     """Initialize all database tables"""
     with sqlite3.connect(DB_PATH) as c:
         # Core tables
-        attest_ensure_tables(c)
-        c.execute("CREATE TABLE IF NOT EXISTS ip_rate_limit (client_ip TEXT, miner_id TEXT, ts INTEGER, PRIMARY KEY (client_ip, miner_id))")
+        c.execute("CREATE TABLE IF NOT EXISTS nonces (nonce TEXT PRIMARY KEY, expires_at INTEGER)")
         c.execute("CREATE TABLE IF NOT EXISTS tickets (ticket_id TEXT PRIMARY KEY, expires_at INTEGER, commitment TEXT)")
 
         # Epoch tables
         c.execute("CREATE TABLE IF NOT EXISTS epoch_state (epoch INTEGER PRIMARY KEY, accepted_blocks INTEGER DEFAULT 0, finalized INTEGER DEFAULT 0)")
         c.execute("CREATE TABLE IF NOT EXISTS epoch_enroll (epoch INTEGER, miner_pk TEXT, weight REAL, PRIMARY KEY (epoch, miner_pk))")
         c.execute("CREATE TABLE IF NOT EXISTS balances (miner_pk TEXT PRIMARY KEY, balance_rtc REAL DEFAULT 0)")
+        ensure_fingerprint_history_table(c)
 
         # Pending transfers (2-phase commit)
         # NOTE: Production DBs may already have a different balances schema; this table is additive.
@@ -913,6 +983,18 @@ def init_db():
             )
         """)
 
+        # RIP-301: Fee events tracking (fees recycled to mining pool)
+        c.execute("""CREATE TABLE IF NOT EXISTS fee_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            source_id TEXT,
+            miner_pk TEXT,
+            fee_rtc REAL NOT NULL,
+            fee_urtc INTEGER NOT NULL,
+            destination TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )""")
+
         c.execute("""
             CREATE TABLE IF NOT EXISTS miner_keys (
                 miner_pk TEXT PRIMARY KEY,
@@ -932,41 +1014,8 @@ def init_db():
             )
         """)
 
-        # GPU Render Protocol (Bounty #30)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS render_escrow (
-                id INTEGER PRIMARY KEY,
-                job_id TEXT UNIQUE NOT NULL,
-                job_type TEXT NOT NULL,
-                from_wallet TEXT NOT NULL,
-                to_wallet TEXT NOT NULL,
-                amount_rtc REAL NOT NULL,
-                status TEXT DEFAULT 'locked',
-                created_at INTEGER NOT NULL,
-                released_at INTEGER
-            )
-        """)
-
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS gpu_attestations (
-                miner_id TEXT PRIMARY KEY,
-                gpu_model TEXT,
-                vram_gb REAL,
-                cuda_version TEXT,
-                benchmark_score REAL,
-                price_render_minute REAL,
-                price_tts_1k_chars REAL,
-                price_stt_minute REAL,
-                price_llm_1k_tokens REAL,
-                supports_render INTEGER DEFAULT 1,
-                supports_tts INTEGER DEFAULT 0,
-                supports_stt INTEGER DEFAULT 0,
-                supports_llm INTEGER DEFAULT 0,
-                tts_models TEXT,
-                llm_models TEXT,
-                last_attestation INTEGER
-            )
-        """)
+        # Governance proposal and voting tables
+        _ensure_governance_tables(c)
 
         # Governance tables (RIP-0142)
         c.execute("""
@@ -1022,6 +1071,20 @@ def init_db():
             )
         """)
         c.execute("""
+            CREATE TABLE IF NOT EXISTS wallet_review_holds(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                wallet TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'needs_review',
+                reason TEXT NOT NULL,
+                coach_note TEXT DEFAULT '',
+                reviewer_note TEXT DEFAULT '',
+                created_at INTEGER NOT NULL,
+                reviewed_at INTEGER DEFAULT 0
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_wallet_review_wallet ON wallet_review_holds(wallet, created_at DESC)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_wallet_review_status ON wallet_review_holds(status, created_at DESC)")
+        c.execute("""
             CREATE TABLE IF NOT EXISTS headers(
                 slot INTEGER PRIMARY KEY,
                 header_json TEXT NOT NULL
@@ -1039,6 +1102,20 @@ def init_db():
                   (int(time.time()),))
         c.execute("INSERT OR IGNORE INTO gov_threshold(id, threshold) VALUES(1, 3)")
         c.execute("INSERT OR IGNORE INTO checkpoints_meta(k, v) VALUES('chain_id', 'rustchain-mainnet-candidate')")
+        # Beacon protocol table
+        c.execute("CREATE TABLE IF NOT EXISTS beacon_envelopes (id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id TEXT NOT NULL, kind TEXT NOT NULL, nonce TEXT UNIQUE NOT NULL, sig TEXT NOT NULL, pubkey TEXT NOT NULL, payload_hash TEXT NOT NULL, anchored INTEGER DEFAULT 0, created_at INTEGER NOT NULL)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_beacon_anchored ON beacon_envelopes(anchored)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_beacon_agent ON beacon_envelopes(agent_id, created_at)")
+
+        # Warthog dual-mining tables
+        if HAVE_WARTHOG:
+            init_warthog_tables(c)
+
+        # RIP-0305 Track C: Bridge API + Lock Ledger tables
+        if HAVE_BRIDGE:
+            init_bridge_schema(c)
+            init_lock_ledger_schema(c)
+
         c.commit()
 
 # Hardware multipliers
@@ -1047,8 +1124,144 @@ HARDWARE_WEIGHTS = {
     "Apple Silicon": {"M1": 1.2, "M2": 1.2, "M3": 1.1, "default": 1.2},
     "x86": {"retro": 1.4, "core2": 1.3, "default": 1.0},
     "x86_64": {"default": 1.0},
-    "ARM": {"default": 1.0}
+    "ARM": {"default": 1.0},
+    "console": {"nes_6502": 2.8, "snes_65c816": 2.7, "n64_mips": 2.5,
+                "genesis_68000": 2.5, "gameboy_z80": 2.6, "ps1_mips": 2.8,
+                "saturn_sh2": 2.6, "gba_arm7": 2.3, "default": 2.5}
 }
+
+POWERPC_ARCHES = {"g3", "g4", "g5", "power8", "power9", "powerpc", "power macintosh"}
+X86_CPU_BRANDS = {"intel", "xeon", "core", "celeron", "pentium", "amd", "ryzen", "epyc", "athlon", "threadripper"}
+ARM_CPU_BRANDS = {"arm", "aarch64", "cortex", "neoverse", "apple m1", "apple m2", "apple m3"}
+
+
+def _fingerprint_checks_map(fingerprint: dict) -> dict:
+    """
+    Extract the checks dictionary from a hardware fingerprint payload.
+
+    Args:
+        fingerprint: Hardware fingerprint dict containing device and check data.
+
+    Returns:
+        dict: The 'checks' section of the fingerprint, or empty dict if invalid.
+    """
+    if not isinstance(fingerprint, dict):
+        return {}
+    checks = fingerprint.get("checks", {})
+    return checks if isinstance(checks, dict) else {}
+
+
+def _fingerprint_check_data(fingerprint: dict, check_name: str) -> dict:
+    """
+    Extract specific check data from a hardware fingerprint by check name.
+
+    Args:
+        fingerprint: Hardware fingerprint dict containing checks and device info.
+        check_name: Name of the specific check to extract (e.g., 'simd_identity').
+
+    Returns:
+        dict: The 'data' section of the specified check, or empty dict if not found.
+    """
+    item = _fingerprint_checks_map(fingerprint).get(check_name, {})
+    if isinstance(item, dict):
+        data = item.get("data", {})
+        return data if isinstance(data, dict) else {}
+    return {}
+
+
+def _claimed_family_and_arch(device: dict) -> tuple:
+    """
+    Extract the claimed device family and architecture from a device dict.
+    
+    Args:
+        device: Device information dict with family/arch fields.
+    
+    Returns:
+        tuple: (family, arch) strings. Defaults to ('x86', 'default') if not provided.
+    """
+    family = str(device.get("device_family") or device.get("family") or "x86")
+    arch = str(device.get("device_arch") or device.get("arch") or "default")
+    return family, arch
+
+
+def _cpu_brand_string(device: dict) -> str:
+    """
+    Build a lowercase CPU brand string from available device fields.
+    
+    Args:
+        device: Device information dict with cpu/model/brand fields.
+    
+    Returns:
+        str: Concatenated brand string in lowercase, or empty string if no fields.
+    """
+    return " ".join(
+        str(device.get(key) or "").strip()
+        for key in ("cpu", "device_model", "model", "brand")
+        if str(device.get(key) or "").strip()
+    ).lower()
+
+
+def _has_any_token(text: str, tokens: set) -> bool:
+    return any(token in text for token in tokens)
+
+
+def _claims_powerpc(device: dict) -> bool:
+    family, arch = _claimed_family_and_arch(device)
+    family_lower = family.lower()
+    arch_lower = arch.lower()
+    return "powerpc" in family_lower or "ppc" in family_lower or arch_lower in POWERPC_ARCHES
+
+
+def _powerpc_cpu_brand_matches(device: dict) -> bool:
+    cpu_brand = _cpu_brand_string(device)
+    if not cpu_brand:
+        return False
+    if _has_any_token(cpu_brand, X86_CPU_BRANDS | ARM_CPU_BRANDS):
+        return False
+    return any(token in cpu_brand for token in ("powerpc", "ppc", "ibm power", "g3", "g4", "g5", "7447", "7450", "7455", "7448", "970", "power8", "power9"))
+
+
+def _has_powerpc_simd_evidence(fingerprint: dict) -> bool:
+    simd_data = _fingerprint_check_data(fingerprint, "simd_identity")
+    x86_features = simd_data.get("x86_features", [])
+    if not isinstance(x86_features, list):
+        x86_features = []
+    has_x86 = bool(x86_features) or bool(simd_data.get("has_sse")) or bool(simd_data.get("has_avx"))
+    has_ppc = bool(
+        simd_data.get("altivec")
+        or simd_data.get("vsx")
+        or simd_data.get("vec_perm")
+        or simd_data.get("has_altivec")
+    )
+    return has_ppc and not has_x86
+
+
+def _has_powerpc_cache_profile(fingerprint: dict) -> bool:
+    cache_data = _fingerprint_check_data(fingerprint, "cache_timing")
+    arch_hint = str(cache_data.get("arch") or cache_data.get("architecture") or "").lower()
+    if "powerpc" in arch_hint or "ppc" in arch_hint:
+        return True
+    l2_l1_ratio = float(cache_data.get("l2_l1_ratio", 0.0) or 0.0)
+    l3_l2_ratio = float(cache_data.get("l3_l2_ratio", 0.0) or 0.0)
+    hierarchy_ratio = float(cache_data.get("hierarchy_ratio", 0.0) or 0.0)
+    return (l2_l1_ratio >= 1.05 and l3_l2_ratio >= 1.05) or hierarchy_ratio >= 1.2
+
+
+def derive_verified_device(device: dict, fingerprint: dict, fingerprint_passed: bool) -> dict:
+    family, arch = _claimed_family_and_arch(device)
+    if not _claims_powerpc(device):
+        return {"device_family": family, "device_arch": arch}
+
+    cpu_brand = _cpu_brand_string(device)
+    simd_data = _fingerprint_check_data(fingerprint, "simd_identity")
+    if fingerprint_passed and _powerpc_cpu_brand_matches(device) and _has_powerpc_simd_evidence(fingerprint) and _has_powerpc_cache_profile(fingerprint):
+        return {"device_family": "PowerPC", "device_arch": arch.upper()}
+
+    if _has_any_token(cpu_brand, ARM_CPU_BRANDS) or bool(simd_data.get("has_neon")):
+        return {"device_family": "ARM", "device_arch": "default"}
+    if _has_any_token(cpu_brand, X86_CPU_BRANDS) or bool(simd_data.get("has_sse")) or bool(simd_data.get("has_avx")):
+        return {"device_family": "x86_64", "device_arch": "default"}
+    return {"device_family": "x86", "device_arch": "default"}
 
 # RIP-0146b: Enrollment enforcement config
 ENROLL_REQUIRE_TICKET = os.getenv("ENROLL_REQUIRE_TICKET", "1") == "1"
@@ -1162,16 +1375,175 @@ def auto_induct_to_hall(miner: str, device: dict):
     except Exception as e:
         print(f"[HALL] Auto-induct error: {e}")
 
-def record_attestation_success(miner: str, device: dict, fingerprint_passed: bool = False, source_ip: str = None):
+def record_attestation_success(miner: str, device: dict, fingerprint_passed: bool = False, source_ip: str = None, signals: dict = None, fingerprint: dict = None):
     now = int(time.time())
+    verified_device = derive_verified_device(device or {}, fingerprint if isinstance(fingerprint, dict) else {}, fingerprint_passed)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
             INSERT OR REPLACE INTO miner_attest_recent (miner, ts_ok, device_family, device_arch, entropy_score, fingerprint_passed, source_ip)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (miner, now, device.get("device_family", device.get("family", "unknown")), device.get("device_arch", device.get("arch", "unknown")), 0.0, 1 if fingerprint_passed else 0, source_ip))
+        """, (miner, now, verified_device["device_family"], verified_device["device_arch"], 0.0, 1 if fingerprint_passed else 0, source_ip))
+        _ = append_fingerprint_snapshot(conn, miner, fingerprint if isinstance(fingerprint, dict) else {}, now)
         conn.commit()
+
+        # RIP-201: Record fleet immune system signals
+        if HAVE_FLEET_IMMUNE:
+            try:
+                record_fleet_signals(conn, miner, device, signals or {},
+                                     fingerprint, now, ip_address=source_ip)
+            except Exception as _fe:
+                print(f"[RIP-201] Fleet signal recording warning: {_fe}")
     # Auto-induct to Hall of Rust
-    auto_induct_to_hall(miner, device)
+    auto_induct_to_hall(miner, verified_device)
+
+
+TEMPORAL_HISTORY_LIMIT = 10
+TEMPORAL_DRIFT_BANDS = {
+    "clock_drift_cv": (0.0005, 0.35),
+    "thermal_variance": (0.05, 25.0),
+    "jitter_cv": (0.0001, 0.50),
+    "cache_hierarchy_ratio": (1.10, 20.0),
+}
+
+
+def ensure_fingerprint_history_table(conn):
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS miner_fingerprint_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            miner TEXT NOT NULL,
+            ts INTEGER NOT NULL,
+            profile_json TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mfh_miner_ts ON miner_fingerprint_history(miner, ts DESC)")
+
+
+def extract_temporal_profile(fingerprint: dict) -> dict:
+    checks = (fingerprint or {}).get("checks", {}) if isinstance(fingerprint, dict) else {}
+
+    def _check_data(name):
+        item = checks.get(name, {})
+        if isinstance(item, dict):
+            data = item.get("data", {})
+            return data if isinstance(data, dict) else {}
+        return {}
+
+    clock = _check_data("clock_drift")
+    thermal = _check_data("thermal_entropy") or _check_data("thermal_drift")
+    jitter = _check_data("instruction_jitter")
+    cache = _check_data("cache_timing")
+
+    return {
+        "clock_drift_cv": float(clock.get("cv", 0.0) or 0.0),
+        "thermal_variance": float(thermal.get("variance", 0.0) or 0.0),
+        "jitter_cv": float(jitter.get("cv", 0.0) or jitter.get("stddev_ns", 0.0) or 0.0),
+        "cache_hierarchy_ratio": float(cache.get("hierarchy_ratio", 0.0) or 0.0),
+    }
+
+
+def append_fingerprint_snapshot(conn, miner: str, fingerprint: dict, now: int) -> list:
+    ensure_fingerprint_history_table(conn)
+    profile = extract_temporal_profile(fingerprint)
+    conn.execute(
+        "INSERT INTO miner_fingerprint_history (miner, ts, profile_json) VALUES (?, ?, ?)",
+        (miner, now, json.dumps(profile, separators=(",", ":"))),
+    )
+    conn.execute(
+        """
+        DELETE FROM miner_fingerprint_history
+        WHERE miner = ? AND id NOT IN (
+            SELECT id FROM miner_fingerprint_history
+            WHERE miner = ?
+            ORDER BY ts DESC, id DESC
+            LIMIT ?
+        )
+        """,
+        (miner, miner, TEMPORAL_HISTORY_LIMIT),
+    )
+    rows = conn.execute(
+        "SELECT ts, profile_json FROM miner_fingerprint_history WHERE miner = ? ORDER BY ts ASC, id ASC",
+        (miner,),
+    ).fetchall()
+    seq = []
+    for ts, profile_json in rows:
+        try:
+            seq.append({"ts": int(ts), "profile": json.loads(profile_json or "{}")})
+        except Exception:
+            continue
+    return seq
+
+
+def fetch_miner_fingerprint_sequence(conn, miner: str) -> list:
+    ensure_fingerprint_history_table(conn)
+    rows = conn.execute(
+        "SELECT ts, profile_json FROM miner_fingerprint_history WHERE miner = ? ORDER BY ts ASC, id ASC",
+        (miner,),
+    ).fetchall()
+    out = []
+    for ts, profile_json in rows:
+        try:
+            out.append({"ts": int(ts), "profile": json.loads(profile_json or "{}")})
+        except Exception:
+            continue
+    return out
+
+
+def validate_temporal_consistency(sequence: list, current_profile: dict = None) -> dict:
+    samples = list(sequence or [])
+    if current_profile is not None:
+        samples.append({"ts": int(time.time()), "profile": current_profile})
+    if len(samples) < 3:
+        return {
+            "score": 1.0,
+            "review_flag": False,
+            "reason": "insufficient_history",
+            "flags": [],
+            "check_scores": {},
+        }
+
+    flags = []
+    check_scores = {}
+    for metric, (low, high) in TEMPORAL_DRIFT_BANDS.items():
+        values = []
+        for s in samples:
+            p = s.get("profile", {}) if isinstance(s, dict) else {}
+            if isinstance(p, dict):
+                v = float(p.get(metric, 0.0) or 0.0)
+                if v > 0:
+                    values.append(v)
+
+        if len(values) < 3:
+            check_scores[metric] = 1.0
+            continue
+
+        avg = sum(values) / len(values)
+        spread = statistics.pstdev(values)
+        rel_var = spread / max(abs(avg), 1e-9)
+
+        score = 1.0
+        if rel_var < 0.01:
+            flags.append(f"frozen_profile:{metric}")
+            score = min(score, 0.2)
+        if rel_var > 0.8:
+            flags.append(f"noisy_profile:{metric}")
+            score = min(score, 0.3)
+        if avg < low or avg > high:
+            flags.append(f"drift_out_of_band:{metric}")
+            score = min(score, 0.4)
+
+        check_scores[metric] = score
+
+    score = sum(check_scores.values()) / max(len(check_scores), 1)
+    review_flag = any(f.startswith("frozen_profile") or f.startswith("noisy_profile") or f.startswith("drift_out_of_band") for f in flags)
+    return {
+        "score": round(score, 4),
+        "review_flag": review_flag,
+        "reason": "temporal_review_required" if review_flag else "temporal_consistent",
+        "flags": flags,
+        "check_scores": check_scores,
+    }
 # =============================================================================
 # FINGERPRINT VALIDATION (RIP-PoA Anti-Emulation)
 # =============================================================================
@@ -1218,12 +1590,78 @@ def validate_fingerprint_data(fingerprint: dict, claimed_device: dict = None) ->
     Handles BOTH formats:
     - New Python format: {"checks": {"clock_drift": {"passed": true, "data": {...}}}}
     - C miner format: {"checks": {"clock_drift": true}}
+    
+    FIX #1147: Added defensive type checking for all nested access to prevent crashes
+    from malformed payloads.
     """
     if not fingerprint:
-        return False, "missing_fingerprint_data"
+        # FIX #305: Missing fingerprint data is a validation failure
+        return False, "no_fingerprint_data"
+    if not isinstance(fingerprint, dict):
+        return False, "fingerprint_not_dict"
 
-    checks = fingerprint.get("checks", {})
-    claimed_device = claimed_device or {}
+    checks = _fingerprint_checks_map(fingerprint)
+    claimed_device = claimed_device if isinstance(claimed_device, dict) else {}
+
+    # FIX #305: Reject empty fingerprint payloads (e.g. fingerprint={} or checks={})
+    if not checks:
+        return False, "empty_fingerprint_checks"
+
+    # FIX #305: Require at least anti_emulation and clock_drift evidence
+    # FIX 2026-02-28: PowerPC/legacy miners may not support clock_drift
+    # (time.perf_counter_ns requires Python 3.7+, old Macs run Python 2.x)
+    # For known vintage architectures, relax clock_drift if anti_emulation passes.
+    # FIX #1147: Defensive type checking for claimed_arch_lower
+    claimed_arch = (claimed_device.get("device_arch") or
+                   claimed_device.get("arch", "modern"))
+    if not isinstance(claimed_arch, str):
+        claimed_arch = "modern"
+    claimed_arch_lower = claimed_arch.lower()
+    vintage_relaxed_archs = {"g4", "g5", "g3", "powerpc", "power macintosh",
+                             "powerpc g4", "powerpc g5", "powerpc g3",
+                             "power8", "power9", "68k", "m68k"}
+    # RIP-304: Console miners via Pico bridge have their own fingerprint checks
+    console_archs = {"nes_6502", "snes_65c816", "n64_mips", "gba_arm7",
+                     "genesis_68000", "sms_z80", "saturn_sh2",
+                     "gameboy_z80", "gameboy_color_z80", "ps1_mips",
+                     "6502", "65c816", "z80", "sh2"}
+    is_vintage = claimed_arch_lower in vintage_relaxed_archs
+    is_console = claimed_arch_lower in console_archs
+
+    # RIP-304: Console miners use Pico bridge fingerprinting (ctrl_port_timing
+    # replaces clock_drift; anti_emulation still required via timing CV)
+    # FIX #1147: Ensure bridge_type is a string
+    bridge_type = fingerprint.get("bridge_type", "")
+    if not isinstance(bridge_type, str):
+        bridge_type = ""
+    if is_console or bridge_type == "pico_serial":
+        # Console: accept ctrl_port_timing OR anti_emulation
+        # Pico bridge provides its own set of checks
+        has_ctrl_timing = "ctrl_port_timing" in checks
+        has_anti_emu = "anti_emulation" in checks
+        if has_ctrl_timing or has_anti_emu:
+            required_checks = [k for k in ["ctrl_port_timing", "anti_emulation"] if k in checks]
+            print(f"[FINGERPRINT] Console arch {claimed_arch_lower} (bridge={bridge_type}) - using Pico bridge checks")
+        else:
+            return False, "console_no_bridge_checks"
+    elif is_vintage:
+        # Vintage: only anti_emulation is strictly required
+        required_checks = ["anti_emulation"]
+        print(f"[FINGERPRINT] Vintage arch {claimed_arch_lower} - relaxed clock_drift requirement")
+    else:
+        required_checks = ["anti_emulation", "clock_drift"]
+
+    for check_name in required_checks:
+        if check_name not in checks:
+            return False, f"missing_required_check:{check_name}"
+        check_entry = checks[check_name]
+        # Bool-only checks (C miner compat) are OK - validated in phase checks below
+        # But dict checks MUST have a "data" field with actual content
+        if isinstance(check_entry, dict) and not check_entry.get("data"):
+            return False, f"empty_check_data:{check_name}"
+
+    # If vintage and clock_drift IS present, still validate it (do not skip)
+    # This only relaxes the REQUIREMENT, not the validation
 
     def get_check_status(check_data):
         """Handle both bool and dict formats for check results"""
@@ -1245,6 +1683,8 @@ def validate_fingerprint_data(fingerprint: dict, claimed_device: dict = None) ->
     # Anti-emulation: MUST have raw data if present
     if isinstance(anti_emu_check, dict):
         anti_emu_data = anti_emu_check.get("data", {})
+        if not isinstance(anti_emu_data, dict):
+            anti_emu_data = {}
         # Require evidence of actual checks being performed
         has_evidence = (
             "vm_indicators" in anti_emu_data or
@@ -1268,6 +1708,8 @@ def validate_fingerprint_data(fingerprint: dict, claimed_device: dict = None) ->
     # Clock drift: MUST have statistical data if present
     if isinstance(clock_check, dict):
         clock_data = clock_check.get("data", {})
+        if not isinstance(clock_data, dict):
+            clock_data = {}
         cv = clock_data.get("cv", 0)
         samples = clock_data.get("samples", 0)
 
@@ -1275,8 +1717,6 @@ def validate_fingerprint_data(fingerprint: dict, claimed_device: dict = None) ->
         if clock_check.get("passed") == True and samples == 0 and cv == 0:
             print(f"[FINGERPRINT] REJECT: clock_drift claims pass but no samples/cv")
             return False, "clock_drift_no_evidence"
-        if clock_check.get("passed") == True and samples < 32:
-            return False, f"clock_drift_insufficient_samples:{samples}"
 
         if cv < 0.0001 and cv != 0:
             return False, "timing_too_uniform"
@@ -1296,28 +1736,42 @@ def validate_fingerprint_data(fingerprint: dict, claimed_device: dict = None) ->
             return False, "clock_drift_failed_bool"
 
     # ── PHASE 2: Cross-validate device claims against fingerprint ──
-    claimed_arch = (claimed_device.get("device_arch") or
-                   claimed_device.get("arch", "modern")).lower()
+    # FIX #1147: Defensive type checking for claimed_arch
+    claimed_arch = claimed_device.get("device_arch") or claimed_device.get("arch", "modern")
+    if not isinstance(claimed_arch, str):
+        claimed_arch = "modern"
+    claimed_arch = claimed_arch.lower()
 
     # If claiming PowerPC, check for x86-specific signals in fingerprint
-    if claimed_arch in {"g4", "g5", "g3", "powerpc", "power macintosh"}:
+    if claimed_arch in POWERPC_ARCHES:
+        # FIX #1147: Check for x86 SIMD features on PowerPC claims (defensive type checking)
         simd_check = checks.get("simd_identity")
         if isinstance(simd_check, dict):
             simd_data = simd_check.get("data", {})
-            # x86 SIMD features should NOT be present on PowerPC
+            if not isinstance(simd_data, dict):
+                simd_data = {}
             x86_features = simd_data.get("x86_features", [])
+            if not isinstance(x86_features, list):
+                x86_features = []
             if x86_features:
                 print(f"[FINGERPRINT] REJECT: claims {claimed_arch} but has x86 SIMD: {x86_features}")
                 return False, f"arch_mismatch:claims_{claimed_arch}_has_x86_simd"
+        if not _powerpc_cpu_brand_matches(claimed_device):
+            print(f"[FINGERPRINT] REJECT: claims {claimed_arch} but CPU brand does not match PowerPC")
+            return False, f"cpu_brand_mismatch:claims_{claimed_arch}"
 
-            # PowerPC should have altivec/vsx indicators
-            has_ppc_simd = simd_data.get("altivec") or simd_data.get("vsx") or simd_data.get("has_altivec")
-            # Don't reject if no SIMD data at all (old miners) but log it
-            if x86_features and not has_ppc_simd:
-                print(f"[FINGERPRINT] SUSPICIOUS: claims {claimed_arch}, x86 SIMD present, no AltiVec")
+        if not _has_powerpc_simd_evidence(fingerprint):
+            print(f"[FINGERPRINT] REJECT: claims {claimed_arch} but lacks PowerPC SIMD evidence")
+            return False, f"missing_powerpc_simd:{claimed_arch}"
+
+        if not _has_powerpc_cache_profile(fingerprint):
+            print(f"[FINGERPRINT] REJECT: claims {claimed_arch} but lacks PowerPC cache profile")
+            return False, f"missing_powerpc_cache_profile:{claimed_arch}"
 
     # ── PHASE 3: ROM fingerprint (retro platforms) ──
     rom_passed, rom_data = get_check_status(checks.get("rom_fingerprint"))
+    if not isinstance(rom_data, dict):
+        rom_data = {}
     if rom_passed == False:
         return False, f"rom_check_failed:{rom_data.get('fail_reason', 'unknown')}"
     if rom_data.get("emulator_detected"):
@@ -1326,6 +1780,9 @@ def validate_fingerprint_data(fingerprint: dict, claimed_device: dict = None) ->
     # ── PHASE 4: Overall check with hard/soft distinction ──
     if fingerprint.get("all_passed") == False:
         SOFT_CHECKS = {"cache_timing"}
+        # FIX 2026-02-28: For vintage archs, clock_drift is soft (may not be available)
+        if is_vintage:
+            SOFT_CHECKS = SOFT_CHECKS | {"clock_drift"}
         failed_checks = []
         for k, v in checks.items():
             passed, _ = get_check_status(v)
@@ -1374,12 +1831,14 @@ def check_vm_signatures_server_side(device: dict, signals: dict) -> tuple:
     """Server-side VM detection from device/signal data."""
     indicators = []
 
-    hostname = signals.get("hostname", "").lower()
+    raw_hostname = signals.get("hostname")
+    hostname = (raw_hostname if isinstance(raw_hostname, str) else "").lower()
     for sig in KNOWN_VM_SIGNATURES:
         if sig in hostname:
             indicators.append(f"hostname:{sig}")
 
-    cpu = device.get("cpu", "").lower()
+    raw_cpu = device.get("cpu")
+    cpu = (raw_cpu if isinstance(raw_cpu, str) else "").lower()
     for sig in KNOWN_VM_SIGNATURES:
         if sig in cpu:
             indicators.append(f"cpu:{sig}")
@@ -1612,282 +2071,15 @@ def openapi_spec():
 
 @app.route('/explorer', methods=['GET'])
 def explorer():
-    """Lightweight blockchain explorer interface"""
-    html = """<!DOCTYPE html>
-<html>
-<head>
-    <title>RustChain v2 Explorer</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
-        .container { max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        .header { text-align: center; margin-bottom: 30px; }
-        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 30px; }
-        .stat-card { background: #f8f9fa; padding: 15px; border-radius: 6px; border-left: 4px solid #007bff; }
-        .stat-value { font-size: 24px; font-weight: bold; color: #007bff; }
-        .stat-label { color: #666; font-size: 14px; }
-        .query-section { margin-bottom: 30px; }
-        .query-form { display: flex; gap: 10px; margin-bottom: 15px; align-items: center; }
-        .query-input { padding: 8px 12px; border: 1px solid #ddd; border-radius: 4px; flex: 1; }
-        .query-button { padding: 8px 16px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
-        .query-button:hover { background: #0056b3; }
-        .result-box { background: #f8f9fa; padding: 15px; border-radius: 6px; border: 1px solid #ddd; white-space: pre-wrap; font-family: monospace; }
-        .error { color: #dc3545; }
-        .success { color: #28a745; }
-        h2 { color: #333; border-bottom: 2px solid #007bff; padding-bottom: 5px; }
-        .refresh-btn { background: #28a745; }
-        .refresh-btn:hover { background: #1e7e34; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>RustChain v2 Explorer</h1>
-            <p>Integrated Server with Epoch Rewards, Withdrawals, and Finality</p>
-            <p style="margin-top:10px;">
-              <a href="/museum" style="color:#007bff;text-decoration:none;font-weight:700;">Hardware Museum (2D)</a>
-              &nbsp;|&nbsp;
-              <a href="/museum/3d" style="color:#007bff;text-decoration:none;font-weight:700;">Hardware Museum (3D)</a>
-            </p>
-        </div>
-
-        <div class="stats-grid" id="stats">
-            <!-- Stats will be loaded here -->
-        </div>
-
-        <div class="query-section">
-            <h2>Balance Query</h2>
-            <div class="query-form">
-                <input type="text" id="minerPk" placeholder="Enter miner public key" class="query-input">
-                <button onclick="queryBalance()" class="query-button">Query Balance</button>
-            </div>
-            <div id="balanceResult" class="result-box" style="display: none;"></div>
-        </div>
-
-        <div class="query-section">
-            <h2>Withdrawal History</h2>
-            <div class="query-form">
-                <input type="text" id="withdrawalMinerPk" placeholder="Enter miner public key" class="query-input">
-                <input type="number" id="withdrawalLimit" placeholder="Limit (default: 50)" class="query-input" value="50">
-                <button onclick="queryWithdrawals()" class="query-button">Query History</button>
-            </div>
-            <div id="withdrawalResult" class="result-box" style="display: none;"></div>
-        </div>
-
-        <div class="query-section">
-            <h2>Epoch Information</h2>
-            <div class="query-form">
-                <button onclick="queryEpoch()" class="query-button">Get Current Epoch</button>
-                <button onclick="loadStats()" class="query-button refresh-btn">Refresh Stats</button>
-            </div>
-            <div id="epochResult" class="result-box" style="display: none;"></div>
-        </div>
-    </div>
-
-    <script>
-        async function apiCall(endpoint) {
-            try {
-                const response = await fetch(endpoint);
-                if (!response.ok) {
-                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-                }
-                return await response.json();
-            } catch (error) {
-                throw error;
-            }
-        }
-
-        async function loadStats() {
-            try {
-                const stats = await apiCall('/api/stats');
-                const epoch = await apiCall('/epoch');
-
-                const statsHtml = `
-                    <div class="stat-card">
-                        <div class="stat-value">${stats.version}</div>
-                        <div class="stat-label">Version</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-value">${epoch.epoch}</div>
-                        <div class="stat-label">Current Epoch</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-value">${epoch.slot}</div>
-                        <div class="stat-label">Current Slot</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-value">${stats.total_miners}</div>
-                        <div class="stat-label">Total Miners</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-value">${stats.total_balance.toFixed(4)} RTC</div>
-                        <div class="stat-label">Total Balance</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-value">${epoch.epoch_pot} RTC</div>
-                        <div class="stat-label">Epoch Pot</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-value">${epoch.enrolled_miners}</div>
-                        <div class="stat-label">Enrolled Miners</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-value">${stats.pending_withdrawals}</div>
-                        <div class="stat-label">Pending Withdrawals</div>
-                    </div>
-                `;
-
-                document.getElementById('stats').innerHTML = statsHtml;
-            } catch (error) {
-                document.getElementById('stats').innerHTML = `<div class="error">Error loading stats: ${error.message}</div>`;
-            }
-        }
-
-        async function queryBalance() {
-            const minerPk = document.getElementById('minerPk').value.trim();
-            const resultDiv = document.getElementById('balanceResult');
-
-            if (!minerPk) {
-                resultDiv.innerHTML = '<span class="error">Please enter a miner public key</span>';
-                resultDiv.style.display = 'block';
-                return;
-            }
-
-            try {
-                const balance = await apiCall(`/balance/${encodeURIComponent(minerPk)}`);
-                resultDiv.innerHTML = `<span class="success">Balance for ${balance.miner_pk}:
-${balance.balance_rtc.toFixed(6)} RTC</span>`;
-                resultDiv.style.display = 'block';
-            } catch (error) {
-                resultDiv.innerHTML = `<span class="error">Error querying balance: ${error.message}</span>`;
-                resultDiv.style.display = 'block';
-            }
-        }
-
-        async function queryWithdrawals() {
-            const minerPk = document.getElementById('withdrawalMinerPk').value.trim();
-            const limit = document.getElementById('withdrawalLimit').value || 50;
-            const resultDiv = document.getElementById('withdrawalResult');
-
-            if (!minerPk) {
-                resultDiv.innerHTML = '<span class="error">Please enter a miner public key</span>';
-                resultDiv.style.display = 'block';
-                return;
-            }
-
-            try {
-                const history = await apiCall(`/withdraw/history/${encodeURIComponent(minerPk)}?limit=${limit}`);
-                let output = `<span class="success">Withdrawal History for ${history.miner_pk}:
-Current Balance: ${history.current_balance.toFixed(6)} RTC
-
-Withdrawals (${history.withdrawals.length}):`;
-
-                if (history.withdrawals.length === 0) {
-                    output += '\\nNo withdrawals found.';
-                } else {
-                    history.withdrawals.forEach((w, i) => {
-                        const date = new Date(w.created_at * 1000).toISOString();
-                        output += `\\n${i + 1}. ${w.withdrawal_id}
-   Amount: ${w.amount} RTC (Fee: ${w.fee} RTC)
-   Status: ${w.status}
-   Destination: ${w.destination}
-   Created: ${date}`;
-                        if (w.tx_hash) output += `\\n   TX Hash: ${w.tx_hash}`;
-                    });
-                }
-                output += '</span>';
-
-                resultDiv.innerHTML = output;
-                resultDiv.style.display = 'block';
-            } catch (error) {
-                resultDiv.innerHTML = `<span class="error">Error querying withdrawals: ${error.message}</span>`;
-                resultDiv.style.display = 'block';
-            }
-        }
-
-        async function queryEpoch() {
-            const resultDiv = document.getElementById('epochResult');
-
-            try {
-                const epoch = await apiCall('/epoch');
-                const output = `<span class="success">Current Epoch Information:
-Epoch: ${epoch.epoch}
-Slot: ${epoch.slot}
-Epoch Pot: ${epoch.epoch_pot} RTC
-Enrolled Miners: ${epoch.enrolled_miners}
-Blocks per Epoch: ${epoch.blocks_per_epoch}</span>`;
-
-                resultDiv.innerHTML = output;
-                resultDiv.style.display = 'block';
-            } catch (error) {
-                resultDiv.innerHTML = `<span class="error">Error querying epoch: ${error.message}</span>`;
-                resultDiv.style.display = 'block';
-            }
-        }
-
-        // Load stats on page load
-        loadStats();
-
-        // Auto-refresh stats every 30 seconds
-        setInterval(loadStats, 30000);
-    </script>
-</body>
-</html>"""
-    return html
+    """Real-time block explorer dashboard (Tier 1 + Tier 2 views).
+    Serves from tools/explorer/index.html if available, otherwise falls back to inline HTML."""
+    explorer_file = os.path.join(EXPLORER_DIR, "index.html")
+    if os.path.isfile(explorer_file):
+        return send_from_directory(EXPLORER_DIR, "index.html")
+    # Fallback: serve inline HTML if tools/explorer/ doesn't exist in deployment
+    return "Explorer HTML file not found. Deploy tools/explorer/index.html alongside the server.", 404
 
 # ============= MUSEUM STATIC UI (2D/3D) =============
-
-def _fetch_json_http(url: str, timeout_s: int = 8):
-    req = Request(url, headers={"User-Agent": f"RustChain/{APP_VERSION}"})
-    try:
-        with urlopen(req, timeout=timeout_s) as resp:
-            payload = resp.read().decode("utf-8", errors="replace")
-        return json.loads(payload)
-    except (HTTPError, URLError, TimeoutError, ValueError):
-        return None
-
-
-def _load_hunter_badges(force: bool = False):
-    now = int(time.time())
-    cached = _HUNTER_BADGE_CACHE.get("data")
-    ts = int(_HUNTER_BADGE_CACHE.get("ts") or 0)
-
-    if not force and cached and (now - ts) < _HUNTER_BADGE_TTL_S:
-        return cached
-
-    badges = {}
-    for key, raw_url in HUNTER_BADGE_RAW_URLS.items():
-        badges[key] = _fetch_json_http(raw_url)
-
-    endpoint_urls = {
-        key: f"https://img.shields.io/endpoint?url={quote(raw_url, safe='')}"
-        for key, raw_url in HUNTER_BADGE_RAW_URLS.items()
-    }
-
-    data = {
-        "ok": True,
-        "source": "rustchain-bounties",
-        "fetched_at": now,
-        "ttl_s": _HUNTER_BADGE_TTL_S,
-        "topHunter": badges.get("topHunter"),
-        "totalXp": badges.get("totalXp"),
-        "activeHunters": badges.get("activeHunters"),
-        "legendaryHunters": badges.get("legendaryHunters"),
-        "updatedAt": badges.get("updatedAt"),
-        "rawUrls": HUNTER_BADGE_RAW_URLS,
-        "endpointUrls": endpoint_urls,
-    }
-
-    _HUNTER_BADGE_CACHE["ts"] = now
-    _HUNTER_BADGE_CACHE["data"] = data
-    return data
-
-
-@app.route("/api/hunters/badges", methods=["GET"])
-def api_hunter_badges():
-    """Proxy Hall of Hunters badge JSON via local node API with caching."""
-    refresh = str(request.args.get("refresh", "0")).lower() in {"1", "true", "yes"}
-    return jsonify(_load_hunter_badges(force=refresh))
-
 
 @app.route("/museum", methods=["GET"])
 def museum_2d():
@@ -1912,24 +2104,36 @@ def museum_assets(filename: str):
 
     return _send_from_directory(MUSEUM_DIR, filename)
 
+
+@app.route("/hall-of-fame/machine.html", methods=["GET"])
+def hall_of_fame_machine_page():
+    """Hall of Fame machine detail page."""
+    from flask import send_from_directory as _send_from_directory
+
+    return _send_from_directory(HOF_DIR, "machine.html")
+
+
+@app.route("/dashboard", methods=["GET"])
+def miner_dashboard_page():
+    """Personal miner dashboard single-page UI."""
+    from flask import send_from_directory as _send_from_directory
+    return _send_from_directory(DASHBOARD_DIR, "index.html")
+
 # ============= ATTESTATION ENDPOINTS =============
 
-@app.route('/attest/challenge', methods=['GET', 'POST'])
+@app.route('/attest/challenge', methods=['POST'])
 def get_challenge():
     """Issue challenge for hardware attestation"""
-    now_ts = int(time.time())
     nonce = secrets.token_hex(32)
-    expires = now_ts + ATTEST_CHALLENGE_TTL_SECONDS
+    expires = int(time.time()) + 300  # 5 minutes
 
     with sqlite3.connect(DB_PATH) as c:
-        attest_ensure_tables(c)
-        attest_cleanup_expired(c, now_ts)
         c.execute("INSERT INTO nonces (nonce, expires_at) VALUES (?, ?)", (nonce, expires))
 
     return jsonify({
         "nonce": nonce,
         "expires_at": expires,
-        "server_time": now_ts
+        "server_time": int(time.time())
     })
 
 
@@ -2009,17 +2213,44 @@ def _check_hardware_binding(miner_id: str, device: dict, signals: dict = None, s
 @app.route('/attest/submit', methods=['POST'])
 def submit_attestation():
     """Submit hardware attestation with fingerprint validation"""
-    data = request.get_json()
+    try:
+        return _submit_attestation_impl()
+    except Exception as e:
+        # FIX #1147: Catch all unhandled exceptions to prevent 500 crashes
+        # Log the error for debugging but return a graceful error response
+        import traceback
+        app.logger.error(f"[ATTEST/submit] Unhandled exception: {e}")
+        app.logger.error(f"[ATTEST/submit] Traceback: {traceback.format_exc()}")
+        return jsonify({
+            "ok": False,
+            "error": "internal_error",
+            "message": "Attestation submission failed due to an internal error",
+            "code": "INTERNAL_ERROR"
+        }), 500
+
+
+def _submit_attestation_impl():
+    """Internal implementation of attest/submit with proper error handling"""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({
+            "ok": False,
+            "error": "invalid_json_object",
+            "message": "Expected a JSON object request body",
+            "code": "INVALID_JSON_OBJECT"
+        }), 400
+    payload_error = _validate_attestation_payload_shape(data)
+    if payload_error is not None:
+        return payload_error
 
     # Extract client IP (handle nginx proxy)
-    client_ip = client_ip_from_request(request)
+    client_ip = get_client_ip()
 
     # Extract attestation data
-    miner = data.get('miner') or data.get('miner_id')
-    report = data.get('report', {})
-    nonce = report.get('nonce') or data.get('nonce')
-    challenge = report.get('challenge') or data.get('challenge')
-    device = data.get('device', {})
+    miner = _attest_valid_miner(data.get('miner')) or _attest_valid_miner(data.get('miner_id'))
+    report = _normalize_attestation_report(data.get('report'))
+    nonce = report.get('nonce') or _attest_text(data.get('nonce'))
+    device = _normalize_attestation_device(data.get('device'))
 
     # IP rate limiting (Security Hardening 2026-02-02)
     ip_ok, ip_reason = check_ip_rate_limit(client_ip, miner)
@@ -2031,67 +2262,19 @@ def submit_attestation():
             "message": "Too many unique miners from this IP address",
             "code": "IP_RATE_LIMIT"
         }), 429
-    signals = data.get('signals', {})
-    fingerprint = data.get('fingerprint', {})  # NEW: Extract fingerprint
+    signals = _normalize_attestation_signals(data.get('signals'))
+    fingerprint = _attest_mapping(data.get('fingerprint'))  # NEW: Extract fingerprint
 
-    # Basic validation
-    if not miner:
-        miner = f"anon_{secrets.token_hex(8)}"
-
-    # SECURITY: Check blocked wallets
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute("SELECT reason FROM blocked_wallets WHERE wallet = ?", (miner,))
-        blocked_row = c.fetchone()
-        if blocked_row:
-            return jsonify({"ok": False, "error": "wallet_blocked", "reason": blocked_row[0]}), 403
-
-    now_ts = int(time.time())
-    nonce_ts = extract_attestation_timestamp(data, report, nonce)
-    with sqlite3.connect(DB_PATH) as conn:
-        attest_ensure_tables(conn)
-        attest_cleanup_expired(conn, now_ts)
-
-        if challenge:
-            challenge_ok, challenge_error, challenge_message = attest_validate_challenge(conn, challenge, now_ts=now_ts)
-            if not challenge_ok:
-                return jsonify({
-                    "ok": False,
-                    "error": challenge_error,
-                    "message": challenge_message,
-                    "code": "ATTEST_CHALLENGE_REJECTED"
-                }), 400
-        else:
-            app.logger.warning(f"[ATTEST] challenge missing for miner={miner}; allowing legacy flow")
-
-        if nonce:
-            if nonce_ts is None:
-                app.logger.warning(f"[ATTEST] nonce timestamp missing/unparseable for miner={miner}; replay checks still enforced")
-
-            nonce_ok, nonce_error, nonce_message = attest_validate_and_store_nonce(
-                conn,
-                miner=miner,
-                nonce=nonce,
-                now_ts=now_ts,
-                nonce_ts=nonce_ts,
-            )
-            if not nonce_ok:
-                return jsonify({
-                    "ok": False,
-                    "error": nonce_error,
-                    "message": nonce_message,
-                    "code": "ATTEST_NONCE_REJECTED"
-                }), 409 if nonce_error == "nonce_replay" else 400
-        else:
-            app.logger.warning(f"[ATTEST] nonce missing for miner={miner}; allowing legacy flow")
-
-        conn.commit()
+    # SECURITY: Check wallet review / block registry
+    review_gate = wallet_review_gate_response(miner)
+    if review_gate is not None:
+        return review_gate
 
     # SECURITY: Hardware binding check v2.0 (serial + entropy validation)
     serial = device.get('serial_number') or device.get('serial') or signals.get('serial')
-    cores = device.get('cores', 1)
-    arch = device.get('arch') or device.get('device_arch', 'modern')
-    macs = signals.get('macs', [])
+    cores = _attest_positive_int(device.get('cores'), default=1)
+    arch = _attest_text(device.get('arch')) or _attest_text(device.get('device_arch')) or 'modern'
+    macs = _attest_string_list(signals.get('macs'))
     
     if HW_BINDING_V2 and serial:
         hw_ok, hw_msg, hw_details = bind_hardware_v2(
@@ -2124,37 +2307,83 @@ def submit_attestation():
             }), 409
 
     # RIP-0147a: Check OUI gate
-    macs = signals.get('macs', [])
     if macs:
         oui_ok, oui_info = _check_oui_gate(macs)
         if not oui_ok:
             return jsonify(oui_info), 412
 
     # NEW: Validate fingerprint data (RIP-PoA)
+    # FIX #305: Default to False - must pass validation to earn rewards
     fingerprint_passed = False
-    fingerprint_reason = "missing_fingerprint_data"
+    fingerprint_reason = "not_checked"
 
-    if fingerprint:
+    # FIX #305: Always validate - pass None/empty to validator which rejects them
+    if fingerprint is not None:
         fingerprint_passed, fingerprint_reason = validate_fingerprint_data(fingerprint, claimed_device=device)
-        print(f"[FINGERPRINT] Miner: {miner}")
-        print(f"[FINGERPRINT]   Passed: {fingerprint_passed}")
-        print(f"[FINGERPRINT]   Reason: {fingerprint_reason}")
-
-        if not fingerprint_passed:
-            # VM/emulator detected - allow attestation but with zero weight
-            print(f"[FINGERPRINT] VM/EMULATOR DETECTED - will receive ZERO rewards")
     else:
-        print(f"[FINGERPRINT] Missing fingerprint payload for miner {miner} - zero reward weight")
+        fingerprint_reason = "no_fingerprint_submitted"
+
+    # DEBUG: dump fingerprint payload for diagnosis
+    if miner and 'selena' in miner.lower():
+        import json as _json
+        try:
+            print(f"[FINGERPRINT-DEBUG] g5-selena payload: {_json.dumps(fingerprint, default=str)[:2000]}")
+        except: pass
+    print(f"[FINGERPRINT] Miner: {miner}")
+    print(f"[FINGERPRINT]   Passed: {fingerprint_passed}")
+    print(f"[FINGERPRINT]   Reason: {fingerprint_reason}")
+
+    if not fingerprint_passed:
+        # VM/emulator or missing fingerprint - allow attestation but with zero weight
+        print(f"[FINGERPRINT] FINGERPRINT FAILED - will receive ZERO rewards")
 
     # NEW: Server-side VM check (double-check device/signals)
     vm_ok, vm_reason = check_vm_signatures_server_side(device, signals)
     if not vm_ok:
         print(f"[VM_CHECK] Miner: {miner} - VM DETECTED (zero rewards): {vm_reason}")
         fingerprint_passed = False  # Mark as failed for zero weight
-        fingerprint_reason = f"server_vm_check_failed:{vm_reason}"
+
+    # Warthog dual-mining proof verification
+    # SECURITY: Warthog bonus requires passing hardware fingerprint.
+    # Without this gate, VMs could fake/run Warthog and farm the bonus.
+    warthog_proof = data.get('warthog')
+    warthog_bonus = 1.0
+    if HAVE_WARTHOG and warthog_proof and isinstance(warthog_proof, dict) and warthog_proof.get('enabled'):
+        if not fingerprint_passed:
+            print(f"[WARTHOG] Miner: {miner[:20]}... DENIED - fingerprint failed, no dual-mining bonus")
+        else:
+            try:
+                verified, bonus_tier, wart_reason = verify_warthog_proof(warthog_proof, miner)
+                warthog_bonus = bonus_tier if verified else 1.0
+                _wart_epoch = slot_to_epoch(current_slot())
+                with sqlite3.connect(DB_PATH) as wart_conn:
+                    record_warthog_proof(wart_conn, miner, _wart_epoch, warthog_proof, verified, warthog_bonus, wart_reason)
+                print(f"[WARTHOG] Miner: {miner[:20]}... verified={verified} bonus={warthog_bonus}x reason={wart_reason}")
+            except Exception as _we:
+                print(f"[WARTHOG] Verification error for {miner[:20]}...: {_we}")
+                warthog_bonus = 1.0
 
     # Record successful attestation (with fingerprint status)
-    record_attestation_success(miner, device, fingerprint_passed, client_ip)
+    record_attestation_success(miner, device, fingerprint_passed, client_ip, signals=signals, fingerprint=fingerprint)
+
+    temporal_review = {"score": 1.0, "review_flag": False, "reason": "insufficient_history", "flags": [], "check_scores": {}}
+    try:
+        with sqlite3.connect(DB_PATH) as tconn:
+            temporal_review = validate_temporal_consistency(fetch_miner_fingerprint_sequence(tconn, miner))
+    except Exception as _te:
+        print(f"[TEMPORAL] Warning: {_te}")
+
+    # Update warthog_bonus in attestation record
+    if warthog_bonus > 1.0:
+        try:
+            with sqlite3.connect(DB_PATH) as wb_conn:
+                wb_conn.execute(
+                    "UPDATE miner_attest_recent SET warthog_bonus=? WHERE miner=?",
+                    (warthog_bonus, miner)
+                )
+                wb_conn.commit()
+        except Exception:
+            pass  # Column may not exist yet
 
     # Record MACs if provided
     if macs:
@@ -2164,8 +2393,9 @@ def submit_attestation():
     # This eliminates the need for miners to make a separate POST /epoch/enroll call
     try:
         epoch = slot_to_epoch(current_slot())
-        family = device.get("device_family") or device.get("family") or "x86"
-        arch_for_weight = device.get("device_arch") or device.get("arch") or "default"
+        verified_device = derive_verified_device(device or {}, fingerprint if isinstance(fingerprint, dict) else {}, fingerprint_passed)
+        family = verified_device["device_family"]
+        arch_for_weight = verified_device["device_arch"]
         hw_weight = HARDWARE_WEIGHTS.get(family, {}).get(arch_for_weight, HARDWARE_WEIGHTS.get(family, {}).get("default", 1.0))
         
         # VM miners get minimal weight
@@ -2173,6 +2403,10 @@ def submit_attestation():
             enroll_weight = 0.000000001
         else:
             enroll_weight = hw_weight
+
+        # Issue #19 temporal consistency only sets a review flag (no hard-fail).
+        if temporal_review.get("review_flag"):
+            app.logger.warning(f"[TEMPORAL-REVIEW] {miner[:20]}... flags={temporal_review.get('flags', [])}")
         
         miner_id = data.get("miner_id", miner)
         
@@ -2215,7 +2449,7 @@ def submit_attestation():
     with sqlite3.connect(DB_PATH) as c:
         c.execute(
             "INSERT INTO tickets (ticket_id, expires_at, commitment) VALUES (?, ?, ?)",
-            (ticket_id, int(time.time()) + 3600, report.get('commitment', ''))
+            (ticket_id, int(time.time()) + 3600, str(report.get('commitment', '')))
         )
 
     return jsonify({
@@ -2224,8 +2458,9 @@ def submit_attestation():
         "status": "accepted",
         "device": device,
         "fingerprint_passed": fingerprint_passed,
-        "fingerprint_reason": fingerprint_reason,
-        "macs_recorded": len(macs) if macs else 0
+        "temporal_review_flag": bool(temporal_review.get("review_flag")),
+        "macs_recorded": len(macs) if macs else 0,
+        "warthog_bonus": warthog_bonus
     })
 
 # ============= EPOCH ENDPOINTS =============
@@ -2243,19 +2478,13 @@ def get_epoch():
             (epoch,)
         ).fetchone()[0]
 
-    if not is_admin(request):
-        return jsonify({
-            "epoch": epoch,
-            "blocks_per_epoch": EPOCH_SLOTS,
-            "visibility": "public_redacted"
-        })
-
     return jsonify({
         "epoch": epoch,
         "slot": slot,
         "epoch_pot": PER_EPOCH_RTC,
         "enrolled_miners": enrolled,
-        "blocks_per_epoch": EPOCH_SLOTS
+        "blocks_per_epoch": EPOCH_SLOTS,
+        "total_supply_rtc": TOTAL_SUPPLY_RTC
     })
 
 @app.route('/epoch/enroll', methods=['POST'])
@@ -2264,7 +2493,7 @@ def enroll_epoch():
     data = request.get_json()
 
     # Extract client IP (handle nginx proxy)
-    client_ip = client_ip_from_request(request)
+    client_ip = get_client_ip()
     miner_pk = data.get('miner_pubkey')
     miner_id = data.get('miner_id', miner_pk)  # Use miner_id if provided
     device = data.get('device', {})
@@ -2577,6 +2806,107 @@ def is_admin(req):
     got = req.headers.get("X-Admin-Key", "") or req.headers.get("X-API-Key", "")
     return need and got and (need == got)
 
+
+def ensure_wallet_review_tables(conn):
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS wallet_review_holds(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'needs_review',
+            reason TEXT NOT NULL,
+            coach_note TEXT DEFAULT '',
+            reviewer_note TEXT DEFAULT '',
+            created_at INTEGER NOT NULL,
+            reviewed_at INTEGER DEFAULT 0
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_wallet_review_wallet ON wallet_review_holds(wallet, created_at DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_wallet_review_status ON wallet_review_holds(status, created_at DESC)")
+
+
+def _wallet_review_ui_authorized(req):
+    """Allow the HTML admin review page to use either header auth or an explicit form/query key."""
+    if is_admin(req):
+        return True
+    need = os.environ.get("RC_ADMIN_KEY", "")
+    got = str(req.values.get("admin_key") or "").strip()
+    return bool(need and got and hmac.compare_digest(need, got))
+
+
+def get_wallet_review_counts():
+    """Return grouped wallet review counts for the operator summary surface."""
+    with sqlite3.connect(DB_PATH) as conn:
+        ensure_wallet_review_tables(conn)
+        rows = conn.execute(
+            """
+            SELECT status, COUNT(*) AS count
+            FROM wallet_review_holds
+            GROUP BY status
+            """
+        ).fetchall()
+    counts = {str(status): int(count) for status, count in rows}
+    counts["open_total"] = sum(counts.get(key, 0) for key in ("needs_review", "held", "escalated", "blocked"))
+    return counts
+
+
+def get_wallet_review_entry(conn, wallet: str):
+    ensure_wallet_review_tables(conn)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        """
+        SELECT id, wallet, status, reason, coach_note, reviewer_note, created_at, reviewed_at
+        FROM wallet_review_holds
+        WHERE wallet = ?
+          AND status IN ('needs_review', 'held', 'escalated', 'blocked')
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (wallet,),
+    ).fetchone()
+    if row:
+        return row
+
+    legacy = conn.execute("SELECT reason FROM blocked_wallets WHERE wallet = ?", (wallet,)).fetchone()
+    if legacy:
+        return {
+            "id": None,
+            "wallet": wallet,
+            "status": "blocked",
+            "reason": legacy[0] or "legacy blocked wallet",
+            "coach_note": "",
+            "reviewer_note": "legacy blocked_wallets entry",
+            "created_at": 0,
+            "reviewed_at": 0,
+        }
+    return None
+
+
+def wallet_review_gate_response(wallet: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        entry = get_wallet_review_entry(conn, wallet)
+    if not entry:
+        return None
+
+    status = str(entry["status"])
+    coach_note = entry["coach_note"] if "coach_note" in entry.keys() else ""
+    payload = {
+        "ok": False,
+        "wallet": wallet,
+        "status": status,
+        "reason": entry["reason"],
+        "coach_note": coach_note,
+    }
+    if status in {"needs_review", "held"}:
+        payload["error"] = "wallet_under_review"
+        payload["message"] = "This wallet is under review. Correct the issue and wait for maintainer release."
+        return jsonify(payload), 409
+
+    payload["error"] = "wallet_blocked"
+    payload["message"] = "This wallet has been escalated and cannot attest until a maintainer releases it."
+    return jsonify(payload), 403
+
 @app.route('/admin/oui_deny/enforce', methods=['POST'])
 def admin_oui_enforce():
     """Toggle OUI enforcement (admin only)"""
@@ -2586,6 +2916,393 @@ def admin_oui_enforce():
     enforce = 1 if str(body.get("enforce", "0")).strip() in ("1", "true", "True", "yes") else 0
     kv_set("oui_enforce", enforce)
     return jsonify({"ok": True, "enforce": enforce})
+
+
+@app.route('/admin/wallet-review-holds', methods=['GET'])
+def admin_wallet_review_holds():
+    """List wallet review holds and escalations."""
+    if not is_admin(request):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    status = (request.args.get("status") or "").strip().lower()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        ensure_wallet_review_tables(conn)
+        sql = """
+            SELECT id, wallet, status, reason, coach_note, reviewer_note, created_at, reviewed_at
+            FROM wallet_review_holds
+        """
+        params = []
+        if status:
+            sql += " WHERE status = ?"
+            params.append(status)
+        sql += " ORDER BY created_at DESC LIMIT 200"
+        rows = conn.execute(sql, params).fetchall()
+    return jsonify({
+        "ok": True,
+        "count": len(rows),
+        "entries": [
+            {
+                "id": int(r["id"]),
+                "wallet": r["wallet"],
+                "status": r["status"],
+                "reason": r["reason"],
+                "coach_note": r["coach_note"],
+                "reviewer_note": r["reviewer_note"],
+                "created_at": int(r["created_at"] or 0),
+                "reviewed_at": int(r["reviewed_at"] or 0),
+            }
+            for r in rows
+        ],
+    })
+
+
+@app.route('/admin/wallet-review-holds', methods=['POST'])
+def admin_create_wallet_review_hold():
+    """Create a wallet review hold instead of hard-blocking by default."""
+    if not is_admin(request):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    data = request.get_json(force=True, silent=True) or {}
+    wallet = _attest_valid_miner(data.get("wallet") or data.get("miner") or "")
+    reason = str(data.get("reason") or "manual review required").strip()
+    coach_note = str(data.get("coach_note") or "").strip()
+    status = str(data.get("status") or "needs_review").strip().lower()
+    if not wallet:
+        return jsonify({"ok": False, "error": "invalid wallet"}), 400
+    if status not in {"needs_review", "held", "escalated", "blocked"}:
+        return jsonify({"ok": False, "error": "invalid status"}), 400
+    now = int(time.time())
+    with sqlite3.connect(DB_PATH) as conn:
+        ensure_wallet_review_tables(conn)
+        cur = conn.execute(
+            """
+            INSERT INTO wallet_review_holds(wallet, status, reason, coach_note, reviewer_note, created_at, reviewed_at)
+            VALUES (?, ?, ?, ?, '', ?, 0)
+            """,
+            (wallet, status, reason, coach_note, now),
+        )
+        conn.commit()
+        hold_id = int(cur.lastrowid)
+    return jsonify({"ok": True, "id": hold_id, "wallet": wallet, "status": status, "reason": reason})
+
+
+@app.route('/admin/wallet-review-holds/<int:hold_id>/resolve', methods=['POST'])
+def admin_resolve_wallet_review_hold(hold_id: int):
+    """Resolve a wallet review hold with explicit release/escalation actions."""
+    if not is_admin(request):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    data = request.get_json(force=True, silent=True) or {}
+    action = str(data.get("action") or "release").strip().lower()
+    reviewer_note = str(data.get("reviewer_note") or "").strip()
+    coach_note = str(data.get("coach_note") or "").strip()
+    now = int(time.time())
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        ensure_wallet_review_tables(conn)
+        row = conn.execute(
+            "SELECT id, wallet, status, reason, coach_note FROM wallet_review_holds WHERE id = ?",
+            (hold_id,),
+        ).fetchone()
+        if not row:
+            return jsonify({"ok": False, "error": "hold_not_found"}), 404
+        if action == "release":
+            new_status = "released"
+        elif action == "dismiss":
+            new_status = "dismissed"
+        elif action == "escalate":
+            new_status = "escalated"
+        elif action == "block":
+            new_status = "blocked"
+        else:
+            return jsonify({"ok": False, "error": "invalid_action"}), 400
+        conn.execute(
+            """
+            UPDATE wallet_review_holds
+            SET status = ?, reviewer_note = ?, coach_note = ?, reviewed_at = ?
+            WHERE id = ?
+            """,
+            (
+                new_status,
+                reviewer_note,
+                coach_note or row["coach_note"],
+                now,
+                hold_id,
+            ),
+        )
+        conn.commit()
+        wallet = row["wallet"]
+    return jsonify({"ok": True, "id": hold_id, "wallet": wallet, "status": new_status})
+
+
+@app.route('/admin/ui', methods=['GET'])
+def admin_operator_ui():
+    """Minimal operator landing page for the admin surfaces in this single-file node."""
+    if not _wallet_review_ui_authorized(request):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    admin_key = str(request.values.get("admin_key") or "").strip()
+    counts = get_wallet_review_counts()
+    return render_template_string(
+        """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>RustChain Admin</title>
+  <style>
+    body { font-family: monospace; margin: 24px; background: #111; color: #eee; }
+    a { color: #89dceb; }
+    .panel { border: 1px solid #444; padding: 16px; margin: 0 0 18px 0; background: #181818; }
+    ul { margin: 0; padding-left: 20px; }
+    .meta { color: #bbb; }
+    code { color: #f9e2af; }
+    .statline { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 8px; }
+    .stat { border: 1px solid #444; padding: 8px 12px; background: #141414; min-width: 120px; }
+    .count { display: block; font-size: 22px; color: #f9e2af; }
+  </style>
+</head>
+<body>
+  <h1>RustChain Admin</h1>
+  <p class="meta">Thin operator index for the existing admin endpoints in this node process.</p>
+  <div class="panel">
+    <h2>Wallet Review Queue</h2>
+    <div class="statline">
+      <div class="stat"><span class="count">{{ counts.open_total }}</span>open total</div>
+      <div class="stat"><span class="count">{{ counts.get('needs_review', 0) }}</span>needs_review</div>
+      <div class="stat"><span class="count">{{ counts.get('held', 0) }}</span>held</div>
+      <div class="stat"><span class="count">{{ counts.get('escalated', 0) }}</span>escalated</div>
+      <div class="stat"><span class="count">{{ counts.get('blocked', 0) }}</span>blocked</div>
+    </div>
+  </div>
+  <div class="panel">
+    <h2>Review And Moderation</h2>
+    <ul>
+      <li><a href="/admin/wallet-review-holds/ui{% if admin_key %}?admin_key={{ admin_key|urlencode }}{% endif %}">Wallet Review Holds UI</a> — create holds, coach miners, release, dismiss, escalate, or block.</li>
+    </ul>
+  </div>
+  <div class="panel">
+    <h2>JSON Admin Endpoints</h2>
+    <ul>
+      <li><code>GET /admin/wallet-review-holds</code> — list review entries</li>
+      <li><code>POST /admin/wallet-review-holds</code> — create review entries</li>
+      <li><code>POST /admin/wallet-review-holds/&lt;id&gt;/resolve</code> — resolve review entries</li>
+      <li><code>GET /admin/oui_deny/list</code> — inspect the OUI deny registry</li>
+    </ul>
+  </div>
+</body>
+</html>
+        """,
+        admin_key=admin_key,
+        counts=counts,
+    )
+
+
+@app.route('/admin/wallet-review-holds/ui', methods=['GET', 'POST'])
+def admin_wallet_review_holds_ui():
+    """Small operator UI for wallet review holds without changing the JSON admin API surface."""
+    if not _wallet_review_ui_authorized(request):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    admin_key = str(request.values.get("admin_key") or "").strip()
+    active_status = str(request.values.get("status") or "").strip().lower()
+
+    if request.method == 'POST':
+        now = int(time.time())
+        form_action = str(request.form.get("form_action") or "").strip().lower()
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            ensure_wallet_review_tables(conn)
+            if form_action == "create":
+                wallet = _attest_valid_miner(request.form.get("wallet") or request.form.get("miner") or "")
+                reason = str(request.form.get("reason") or "manual review required").strip()
+                coach_note = str(request.form.get("coach_note") or "").strip()
+                status = str(request.form.get("review_status") or "needs_review").strip().lower()
+                if wallet and status in {"needs_review", "held", "escalated", "blocked"}:
+                    conn.execute(
+                        """
+                        INSERT INTO wallet_review_holds(wallet, status, reason, coach_note, reviewer_note, created_at, reviewed_at)
+                        VALUES (?, ?, ?, ?, '', ?, 0)
+                        """,
+                        (wallet, status, reason, coach_note, now),
+                    )
+                    conn.commit()
+            elif form_action == "resolve":
+                hold_id = int(request.form.get("hold_id") or "0")
+                action = str(request.form.get("review_action") or "release").strip().lower()
+                reviewer_note = str(request.form.get("reviewer_note") or "").strip()
+                coach_note = str(request.form.get("coach_note") or "").strip()
+                if action in {"release", "dismiss", "escalate", "block"} and hold_id > 0:
+                    row = conn.execute(
+                        "SELECT id, coach_note FROM wallet_review_holds WHERE id = ?",
+                        (hold_id,),
+                    ).fetchone()
+                    if row:
+                        new_status = {
+                            "release": "released",
+                            "dismiss": "dismissed",
+                            "escalate": "escalated",
+                            "block": "blocked",
+                        }[action]
+                        conn.execute(
+                            """
+                            UPDATE wallet_review_holds
+                            SET status = ?, reviewer_note = ?, coach_note = ?, reviewed_at = ?
+                            WHERE id = ?
+                            """,
+                            (new_status, reviewer_note, coach_note or row["coach_note"], now, hold_id),
+                        )
+                        conn.commit()
+        query = ""
+        if active_status or admin_key:
+            parts = []
+            if active_status:
+                parts.append(f"status={active_status}")
+            if admin_key:
+                parts.append(f"admin_key={admin_key}")
+            query = "?" + "&".join(parts)
+        return redirect(f"/admin/wallet-review-holds/ui{query}", code=303)
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        ensure_wallet_review_tables(conn)
+        sql = """
+            SELECT id, wallet, status, reason, coach_note, reviewer_note, created_at, reviewed_at
+            FROM wallet_review_holds
+        """
+        params = []
+        if active_status:
+            sql += " WHERE status = ?"
+            params.append(active_status)
+        sql += " ORDER BY created_at DESC LIMIT 200"
+        rows = conn.execute(sql, params).fetchall()
+
+    entries = [
+        {
+            "id": int(r["id"]),
+            "wallet": r["wallet"],
+            "status": r["status"],
+            "reason": r["reason"],
+            "coach_note": r["coach_note"] or "",
+            "reviewer_note": r["reviewer_note"] or "",
+            "created_at": int(r["created_at"] or 0),
+            "reviewed_at": int(r["reviewed_at"] or 0),
+        }
+        for r in rows
+    ]
+    return render_template_string(
+        """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>RustChain Wallet Review Holds</title>
+  <style>
+    body { font-family: monospace; margin: 24px; background: #111; color: #eee; }
+    a { color: #89dceb; }
+    form { margin: 0; }
+    .panel { border: 1px solid #444; padding: 16px; margin: 0 0 18px 0; background: #181818; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+    input, select, textarea, button { width: 100%; padding: 8px; box-sizing: border-box; background: #222; color: #eee; border: 1px solid #555; }
+    textarea { min-height: 68px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+    th, td { border: 1px solid #444; padding: 10px; vertical-align: top; }
+    th { background: #1f1f1f; text-align: left; }
+    .filters { display: flex; gap: 12px; flex-wrap: wrap; margin: 8px 0 14px; }
+    .meta { color: #bbb; }
+    .status-needs_review, .status-held { color: #f9e2af; }
+    .status-escalated, .status-blocked { color: #f38ba8; }
+    .status-released, .status-dismissed { color: #a6e3a1; }
+  </style>
+</head>
+<body>
+  <nav><a href="/admin/ui{% if admin_key %}?admin_key={{ admin_key|urlencode }}{% endif %}">admin index</a></nav>
+  <h1>RustChain Wallet Review Holds</h1>
+  <p class="meta">Use this page to create review holds, coach miners, and release or escalate wallets without touching the legacy hard-block list.</p>
+  <div class="filters">
+    <a href="/admin/wallet-review-holds/ui{% if admin_key %}?admin_key={{ admin_key|urlencode }}{% endif %}">all</a>
+    {% for status_value in statuses %}
+    <a href="/admin/wallet-review-holds/ui?status={{ status_value }}{% if admin_key %}&admin_key={{ admin_key|urlencode }}{% endif %}">{{ status_value }}</a>
+    {% endfor %}
+  </div>
+  <div class="panel">
+    <h2>Create Hold</h2>
+    <form method="post" action="/admin/wallet-review-holds/ui">
+      <input type="hidden" name="form_action" value="create">
+      <input type="hidden" name="admin_key" value="{{ admin_key }}">
+      <input type="hidden" name="status" value="{{ active_status }}">
+      <div class="grid">
+        <label>Wallet<input name="wallet" placeholder="RTC... or miner id" required></label>
+        <label>Status
+          <select name="review_status">
+            <option value="needs_review">needs_review</option>
+            <option value="held">held</option>
+            <option value="escalated">escalated</option>
+            <option value="blocked">blocked</option>
+          </select>
+        </label>
+        <label>Reason<input name="reason" placeholder="manual review required" required></label>
+      </div>
+      <p><label>Coach note<textarea name="coach_note" placeholder="Explain what the miner should fix before retrying."></textarea></label></p>
+      <button type="submit">Create Hold</button>
+    </form>
+  </div>
+  <div class="panel">
+    <h2>Open Entries ({{ entries|length }})</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Wallet</th>
+          <th>Status</th>
+          <th>Reason</th>
+          <th>Coach Note</th>
+          <th>Reviewer Note</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for entry in entries %}
+        <tr>
+          <td>{{ entry.id }}</td>
+          <td>{{ entry.wallet }}</td>
+          <td class="status-{{ entry.status }}">{{ entry.status }}</td>
+          <td>{{ entry.reason }}</td>
+          <td>{{ entry.coach_note }}</td>
+          <td>{{ entry.reviewer_note }}</td>
+          <td>
+            <div class="meta">created {{ entry.created_at }}{% if entry.reviewed_at %}, reviewed {{ entry.reviewed_at }}{% endif %}</div>
+            <form method="post" action="/admin/wallet-review-holds/ui" style="margin-top:10px">
+              <input type="hidden" name="form_action" value="resolve">
+              <input type="hidden" name="hold_id" value="{{ entry.id }}">
+              <input type="hidden" name="admin_key" value="{{ admin_key }}">
+              <input type="hidden" name="status" value="{{ active_status }}">
+              <label>Action
+                <select name="review_action">
+                  <option value="release">release</option>
+                  <option value="dismiss">dismiss</option>
+                  <option value="escalate">escalate</option>
+                  <option value="block">block</option>
+                </select>
+              </label>
+              <p><label>Coach note<textarea name="coach_note">{{ entry.coach_note }}</textarea></label></p>
+              <p><label>Reviewer note<textarea name="reviewer_note">{{ entry.reviewer_note }}</textarea></label></p>
+              <button type="submit">Apply</button>
+            </form>
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="7">No wallet review holds for this filter.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>
+        """,
+        entries=entries,
+        active_status=active_status,
+        admin_key=admin_key,
+        statuses=["needs_review", "held", "escalated", "blocked", "released", "dismissed"],
+    )
 
 @app.route('/ops/oui/enforce', methods=['GET'])
 def ops_oui_enforce():
@@ -2618,13 +3335,17 @@ def reject_v1_mine():
 
 @app.route('/withdraw/register', methods=['POST'])
 def register_withdrawal_key():
+    # SECURITY: Registering withdrawal keys allows fund extraction; require admin key.
+    admin_key = request.headers.get("X-Admin-Key", "") or request.headers.get("X-API-Key", "")
+    if admin_key != os.environ.get("RC_ADMIN_KEY", "rustchain_admin_key_2025_secure64"):
+        return jsonify({"error": "Unauthorized - admin key required"}), 401
     """Register sr25519 public key for withdrawals"""
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({"error": "Invalid JSON body"}), 400
 
     # Extract client IP (handle nginx proxy)
-    client_ip = client_ip_from_request(request)
+    client_ip = get_client_ip()
     miner_pk = data.get('miner_pk')
     pubkey_sr25519 = data.get('pubkey_sr25519')
 
@@ -2672,35 +3393,20 @@ def request_withdrawal():
     """Request RTC withdrawal"""
     withdrawal_requests.inc()
 
-    data = request.get_json(silent=True)
-    if not isinstance(data, dict):
-        withdrawal_failed.inc()
-        return jsonify({"error": "Invalid JSON body"}), 400
+    data = request.get_json()
 
     # Extract client IP (handle nginx proxy)
-    client_ip = client_ip_from_request(request)
+    client_ip = get_client_ip()
     miner_pk = data.get('miner_pk')
-    amount_raw = data.get('amount', 0)
+    amount = float(data.get('amount', 0))
     destination = data.get('destination')
     signature = data.get('signature')
     nonce = data.get('nonce')
 
     if not all([miner_pk, destination, signature, nonce]):
-        withdrawal_failed.inc()
         return jsonify({"error": "Missing required fields"}), 400
 
-    try:
-        amount = float(amount_raw)
-    except (TypeError, ValueError):
-        withdrawal_failed.inc()
-        return jsonify({"error": "Amount must be a number"}), 400
-
-    if not math.isfinite(amount) or amount <= 0:
-        withdrawal_failed.inc()
-        return jsonify({"error": "Amount must be a finite positive number"}), 400
-
     if amount < MIN_WITHDRAWAL:
-        withdrawal_failed.inc()
         return jsonify({"error": f"Minimum withdrawal is {MIN_WITHDRAWAL} RTC"}), 400
 
     with sqlite3.connect(DB_PATH) as c:
@@ -2779,6 +3485,18 @@ def request_withdrawal():
         c.execute("UPDATE balances SET balance_rtc = balance_rtc - ? WHERE miner_pk = ?",
                   (total_needed, miner_pk))
 
+        # RIP-301: Route fee to mining pool (founder_community) instead of burning
+        fee_urtc = int(WITHDRAWAL_FEE * UNIT)
+        c.execute(
+            "UPDATE balances SET amount_i64 = amount_i64 + ? WHERE miner_id = ?",
+            (fee_urtc, "founder_community")
+        )
+        c.execute(
+            """INSERT INTO fee_events (source, source_id, miner_pk, fee_rtc, fee_urtc, destination, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            ("withdrawal", withdrawal_id, miner_pk, WITHDRAWAL_FEE, fee_urtc, "founder_community", int(time.time()))
+        )
+
         # Create withdrawal record
         c.execute("""
             INSERT INTO withdrawals (
@@ -2805,6 +3523,58 @@ def request_withdrawal():
         "fee": WITHDRAWAL_FEE,
         "net_amount": amount - WITHDRAWAL_FEE
     })
+
+
+@app.route("/api/fee_pool", methods=["GET"])
+def api_fee_pool():
+    """RIP-301: Fee pool statistics and recent fee events."""
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+
+        # Total fees collected
+        row = c.execute(
+            "SELECT COALESCE(SUM(fee_rtc), 0), COUNT(*) FROM fee_events"
+        ).fetchone()
+        total_fees_rtc = row[0]
+        total_events = row[1]
+
+        # Fees by source
+        sources = {}
+        for src_row in c.execute(
+            "SELECT source, COALESCE(SUM(fee_rtc), 0), COUNT(*) FROM fee_events GROUP BY source"
+        ).fetchall():
+            sources[src_row[0]] = {"total_rtc": src_row[1], "count": src_row[2]}
+
+        # Last 10 fee events
+        recent = []
+        for ev in c.execute(
+            """SELECT source, source_id, miner_pk, fee_rtc, destination,
+                      datetime(created_at, 'unixepoch') as ts
+               FROM fee_events ORDER BY id DESC LIMIT 10"""
+        ).fetchall():
+            recent.append({
+                "source": ev[0], "source_id": ev[1], "payer": ev[2],
+                "fee_rtc": ev[3], "destination": ev[4], "timestamp": ev[5]
+            })
+
+        # Community fund balance (where fees go)
+        fund_row = c.execute(
+            "SELECT COALESCE(amount_i64, 0) FROM balances WHERE miner_id = 'founder_community'"
+        ).fetchone()
+        fund_balance = fund_row[0] / 1_000_000.0 if fund_row else 0.0
+
+    return jsonify({
+        "rip": 301,
+        "description": "Fee Pool Statistics (fees recycled to mining pool)",
+        "total_fees_collected_rtc": total_fees_rtc,
+        "total_fee_events": total_events,
+        "fees_by_source": sources,
+        "destination": "founder_community",
+        "destination_balance_rtc": fund_balance,
+        "withdrawal_fee_rtc": WITHDRAWAL_FEE,
+        "recent_events": recent
+    })
+
 
 @app.route('/withdraw/status/<withdrawal_id>', methods=['GET'])
 def withdrawal_status(withdrawal_id):
@@ -2835,6 +3605,10 @@ def withdrawal_status(withdrawal_id):
 @app.route('/withdraw/history/<miner_pk>', methods=['GET'])
 def withdrawal_history(miner_pk):
     """Get withdrawal history for miner"""
+    # SECURITY FIX 2026-02-15: Require admin key - exposes withdrawal history
+    admin_key = request.headers.get("X-Admin-Key", "") or request.headers.get("X-API-Key", "")
+    if admin_key != os.environ.get("RC_ADMIN_KEY", "rustchain_admin_key_2025_secure64"):
+        return jsonify({"error": "Unauthorized - admin key required"}), 401
     limit = request.args.get('limit', 50, type=int)
 
     with sqlite3.connect(DB_PATH) as c:
@@ -3053,6 +3827,268 @@ def gov_rotate_commit():
             "threshold": thr
         })
 
+@app.route('/governance/propose', methods=['POST'])
+def governance_propose():
+    data = request.get_json(silent=True) or {}
+    proposer_wallet = str(data.get('wallet', '')).strip()
+    title = str(data.get('title', '')).strip()
+    description = str(data.get('description', '')).strip()
+
+    if not proposer_wallet or not title or not description:
+        return jsonify({"ok": False, "error": "wallet, title and description are required"}), 400
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        _ensure_governance_tables(c)
+
+        balance_i64 = _balance_i64_for_wallet(c, proposer_wallet)
+        balance_rtc = balance_i64 / 1_000_000.0
+        if balance_rtc <= GOVERNANCE_MIN_PROPOSER_BALANCE_RTC:
+            return jsonify({
+                "ok": False,
+                "error": "insufficient_balance_to_propose",
+                "required_gt_rtc": GOVERNANCE_MIN_PROPOSER_BALANCE_RTC,
+                "balance_rtc": balance_rtc,
+            }), 403
+
+        now = int(time.time())
+        ends_at = now + GOVERNANCE_ACTIVE_SECONDS
+        c.execute(
+            """
+            INSERT INTO governance_proposals
+            (proposer_wallet, title, description, created_at, activated_at, ends_at, status)
+            VALUES (?, ?, ?, ?, ?, ?, 'active')
+            """,
+            (proposer_wallet, title, description, now, now, ends_at),
+        )
+        proposal_id = c.lastrowid
+        conn.commit()
+
+    return jsonify({
+        "ok": True,
+        "proposal": {
+            "id": proposal_id,
+            "wallet": proposer_wallet,
+            "title": title,
+            "description": description,
+            "status": "active",
+            "created_at": now,
+            "activated_at": now,
+            "ends_at": ends_at,
+            "rules": {
+                "lifecycle": "Draft -> Active (7 days) -> Passed/Failed",
+                "pass_condition": "yes_weight > no_weight at close"
+            }
+        }
+    }), 201
+
+
+@app.route('/governance/proposals', methods=['GET'])
+def governance_proposals():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        _ensure_governance_tables(c)
+
+        rows = c.execute(
+            """
+            SELECT id, proposer_wallet, title, description, created_at, activated_at, ends_at,
+                   status, yes_weight, no_weight
+            FROM governance_proposals
+            ORDER BY id DESC
+            """
+        ).fetchall()
+
+        proposals = []
+        for row in rows:
+            status = _refresh_proposal_status(c, row)
+            proposals.append({
+                "id": row["id"],
+                "proposer_wallet": row["proposer_wallet"],
+                "title": row["title"],
+                "description": row["description"],
+                "created_at": row["created_at"],
+                "activated_at": row["activated_at"],
+                "ends_at": row["ends_at"],
+                "status": status,
+                "yes_weight": float(row["yes_weight"] or 0.0),
+                "no_weight": float(row["no_weight"] or 0.0),
+            })
+        conn.commit()
+
+    return jsonify({"ok": True, "count": len(proposals), "proposals": proposals})
+
+
+@app.route('/governance/proposal/<int:proposal_id>', methods=['GET'])
+def governance_proposal_detail(proposal_id: int):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        _ensure_governance_tables(c)
+        row = c.execute(
+            """
+            SELECT id, proposer_wallet, title, description, created_at, activated_at, ends_at,
+                   status, yes_weight, no_weight
+            FROM governance_proposals
+            WHERE id = ?
+            """,
+            (proposal_id,),
+        ).fetchone()
+
+        if not row:
+            return jsonify({"ok": False, "error": "proposal_not_found"}), 404
+
+        status = _refresh_proposal_status(c, row)
+
+        votes = c.execute(
+            """
+            SELECT voter_wallet, vote, weight, multiplier, base_balance_rtc, created_at
+            FROM governance_votes
+            WHERE proposal_id = ?
+            ORDER BY created_at DESC
+            """,
+            (proposal_id,),
+        ).fetchall()
+        conn.commit()
+
+    yes_weight = float(row["yes_weight"] or 0.0)
+    no_weight = float(row["no_weight"] or 0.0)
+    total_weight = yes_weight + no_weight
+
+    return jsonify({
+        "ok": True,
+        "proposal": {
+            "id": row["id"],
+            "proposer_wallet": row["proposer_wallet"],
+            "title": row["title"],
+            "description": row["description"],
+            "created_at": row["created_at"],
+            "activated_at": row["activated_at"],
+            "ends_at": row["ends_at"],
+            "status": status,
+            "yes_weight": yes_weight,
+            "no_weight": no_weight,
+            "total_weight": total_weight,
+            "result": "passed" if status == "passed" else ("failed" if status == "failed" else "pending"),
+        },
+        "votes": [dict(v) for v in votes],
+    })
+
+
+@app.route('/governance/vote', methods=['POST'])
+def governance_vote():
+    data = request.get_json(silent=True) or {}
+    proposal_id = int(data.get('proposal_id') or 0)
+    wallet = str(data.get('wallet', '')).strip()
+    vote = str(data.get('vote', '')).strip().lower()
+    nonce = str(data.get('nonce', '')).strip()
+    signature = str(data.get('signature', '')).strip()
+    public_key = str(data.get('public_key', '')).strip()
+
+    if not all([proposal_id, wallet, vote in ('yes', 'no'), nonce, signature, public_key]):
+        return jsonify({
+            "ok": False,
+            "error": "proposal_id, wallet, vote(yes/no), nonce, signature, public_key are required",
+        }), 400
+
+    expected_wallet = address_from_pubkey(public_key)
+    if wallet != expected_wallet:
+        return jsonify({
+            "ok": False,
+            "error": "wallet_does_not_match_public_key",
+            "expected": expected_wallet,
+            "got": wallet,
+        }), 400
+
+    vote_message = json.dumps({
+        "proposal_id": proposal_id,
+        "wallet": wallet,
+        "vote": vote,
+        "nonce": nonce,
+    }, sort_keys=True, separators=(",", ":")).encode()
+
+    if not verify_rtc_signature(public_key, vote_message, signature):
+        return jsonify({"ok": False, "error": "invalid_signature"}), 401
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        _ensure_governance_tables(c)
+
+        proposal = c.execute(
+            "SELECT * FROM governance_proposals WHERE id = ?",
+            (proposal_id,),
+        ).fetchone()
+        if not proposal:
+            return jsonify({"ok": False, "error": "proposal_not_found"}), 404
+
+        status = _refresh_proposal_status(c, proposal)
+        if status != 'active':
+            conn.commit()
+            return jsonify({"ok": False, "error": "proposal_not_active", "status": status}), 409
+
+        already = c.execute(
+            "SELECT 1 FROM governance_votes WHERE proposal_id = ? AND voter_wallet = ?",
+            (proposal_id, wallet),
+        ).fetchone()
+        if already:
+            return jsonify({"ok": False, "error": "already_voted"}), 409
+
+        miner_active, multiplier, miner_reason = _get_active_miner_antiquity_multiplier(c, wallet)
+        if not miner_active:
+            return jsonify({"ok": False, "error": "inactive_miner", "reason": miner_reason}), 403
+
+        base_balance_i64 = _balance_i64_for_wallet(c, wallet)
+        base_balance_rtc = base_balance_i64 / 1_000_000.0
+        if base_balance_rtc <= 0:
+            return jsonify({"ok": False, "error": "no_balance"}), 403
+
+        weight = base_balance_rtc * multiplier
+        c.execute(
+            """
+            INSERT INTO governance_votes
+            (proposal_id, voter_wallet, vote, weight, multiplier, base_balance_rtc, signature, public_key, nonce, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (proposal_id, wallet, vote, weight, multiplier, base_balance_rtc, signature, public_key, nonce, int(time.time())),
+        )
+
+        if vote == 'yes':
+            c.execute("UPDATE governance_proposals SET yes_weight = yes_weight + ? WHERE id = ?", (weight, proposal_id))
+        else:
+            c.execute("UPDATE governance_proposals SET no_weight = no_weight + ? WHERE id = ?", (weight, proposal_id))
+
+        updated = c.execute(
+            "SELECT yes_weight, no_weight, status, ends_at FROM governance_proposals WHERE id = ?",
+            (proposal_id,),
+        ).fetchone()
+        conn.commit()
+
+    yes_weight = float(updated[0] or 0.0)
+    no_weight = float(updated[1] or 0.0)
+    status = updated[2]
+
+    return jsonify({
+        "ok": True,
+        "proposal_id": proposal_id,
+        "voter_wallet": wallet,
+        "vote": vote,
+        "base_balance_rtc": base_balance_rtc,
+        "antiquity_multiplier": multiplier,
+        "vote_weight": weight,
+        "status": status,
+        "yes_weight": yes_weight,
+        "no_weight": no_weight,
+        "result": "passed" if status == "passed" else ("failed" if status == "failed" else "pending"),
+    })
+
+
+@app.route('/governance/ui', methods=['GET'])
+def governance_ui_page():
+    return send_file(os.path.join(REPO_ROOT, 'web', 'governance.html'))
+
+
 # ============= GENESIS EXPORT (RIP-0144) =============
 
 @app.route('/genesis/export', methods=['GET'])
@@ -3133,6 +4169,73 @@ def get_stats():
         "security": ["no_mock_sigs", "mandatory_admin_key", "replay_protection", "validated_json"]
     })
 
+
+# ---------- RIP-0200b: Deflationary Bounty Decay ----------
+# Half-life model: bounty multiplier = 0.5^(total_paid / HALF_LIFE)
+# As more RTC is paid from community fund, bounties shrink automatically.
+# This creates scarcity pressure and rewards early contributors.
+
+BOUNTY_INITIAL_FUND = 96673.0  # Original community fund size (RTC)
+BOUNTY_HALF_LIFE = 25000.0     # RTC paid out before bounties halve
+
+@app.route("/api/bounty-multiplier", methods=["GET"])
+def bounty_multiplier():
+    """Get current bounty decay multiplier based on total payouts."""
+    import math
+    with sqlite3.connect(DB_PATH) as c:
+        # Total RTC paid out from community fund (negative deltas)
+        row = c.execute(
+            "SELECT COALESCE(SUM(ABS(delta_i64)), 0) FROM ledger "
+            "WHERE miner_id = ? AND delta_i64 < 0",
+            ("founder_community",)
+        ).fetchone()
+        total_paid_urtc = row[0] if row else 0
+        total_paid_rtc = total_paid_urtc / 1000000.0
+
+        # Current balance
+        bal_row = c.execute(
+            "SELECT COALESCE(amount_i64, 0) FROM balances WHERE miner_id = ?",
+            ("founder_community",)
+        ).fetchone()
+        remaining_urtc = bal_row[0] if bal_row else 0
+        remaining_rtc = remaining_urtc / 1000000.0
+
+    # Half-life decay: multiplier = 0.5^(total_paid / half_life)
+    multiplier = 0.5 ** (total_paid_rtc / BOUNTY_HALF_LIFE)
+
+    # Example: what a 100 RTC bounty would actually pay
+    example_face = 100.0
+    example_actual = round(example_face * multiplier, 2)
+
+    # Milestones
+    milestones = []
+    for pct in [0.75, 0.50, 0.25, 0.10]:
+        # Solve: 0.5^(x/25000) = pct  =>  x = 25000 * log2(1/pct)
+        threshold = BOUNTY_HALF_LIFE * math.log2(1.0 / pct)
+        status = "reached" if total_paid_rtc >= threshold else "upcoming"
+        milestones.append({
+            "multiplier": pct,
+            "rtc_paid_threshold": round(threshold, 0),
+            "status": status
+        })
+
+    return jsonify({
+        "ok": True,
+        "decay_model": "half-life",
+        "half_life_rtc": BOUNTY_HALF_LIFE,
+        "initial_fund_rtc": BOUNTY_INITIAL_FUND,
+        "total_paid_rtc": round(total_paid_rtc, 2),
+        "remaining_rtc": round(remaining_rtc, 2),
+        "current_multiplier": round(multiplier, 4),
+        "current_multiplier_pct": f"{multiplier * 100:.1f}%",
+        "example": {
+            "face_value": example_face,
+            "actual_payout": example_actual,
+            "note": f"A {example_face} RTC bounty currently pays {example_actual} RTC"
+        },
+        "milestones": milestones
+    })
+
 # ---------- RIP-0147a: Admin OUI Management ----------
 
 
@@ -3202,24 +4305,6 @@ def api_miners():
     """Return list of attested miners with their PoA details"""
     import time as _time
     now = int(_time.time())
-
-    if not is_admin(request):
-        with sqlite3.connect(DB_PATH) as conn:
-            active_miners = conn.execute(
-                """
-                SELECT COUNT(DISTINCT miner)
-                FROM miner_attest_recent
-                WHERE ts_ok > ?
-                """,
-                (now - 3600,),
-            ).fetchone()[0]
-
-        return jsonify({
-            "active_miners": int(active_miners or 0),
-            "window_seconds": 3600,
-            "visibility": "public_redacted"
-        })
-
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
@@ -3282,21 +4367,13 @@ def api_miners():
 
 @app.route("/api/badge/<miner_id>", methods=["GET"])
 def api_badge(miner_id: str):
-    """Shields.io-compatible JSON badge endpoint for a miner's mining status.
-
-    Usage in README:
-        ![Mining Status](https://img.shields.io/endpoint?url=https://rustchain.org/api/badge/YOUR_MINER_ID)
-
-    Returns JSON with schemaVersion, label, message, and color per
-    https://shields.io/endpoint spec.
-    """
+    """Shields.io-compatible JSON badge endpoint for mining status."""
     miner_id = miner_id.strip()
     if not miner_id:
         return jsonify({"schemaVersion": 1, "label": "RustChain", "message": "invalid", "color": "red"}), 400
 
     now = int(time.time())
     status = "Inactive"
-    hw_type = ""
     multiplier = 1.0
 
     try:
@@ -3310,16 +4387,15 @@ def api_badge(miner_id: str):
 
             if row and row["ts_ok"]:
                 age = now - int(row["ts_ok"])
-                if age < 1200:       # attested within 20 minutes
+                if age < 1200:
                     status = "Active"
-                elif age < 3600:     # attested within 1 hour
+                elif age < 3600:
                     status = "Idle"
                 else:
                     status = "Inactive"
 
                 fam = (row["device_family"] or "unknown")
                 arch = (row["device_arch"] or "unknown")
-                hw_type = f"{fam}/{arch}"
                 multiplier = HARDWARE_WEIGHTS.get(fam, {}).get(
                     arch, HARDWARE_WEIGHTS.get(fam, {}).get("default", 1.0)
                 )
@@ -3328,26 +4404,100 @@ def api_badge(miner_id: str):
 
     color_map = {"Active": "brightgreen", "Idle": "yellow", "Inactive": "lightgrey"}
     color = color_map.get(status, "lightgrey")
-    label = f"⛏ {miner_id}"
-
-    message = status
-    if status == "Active" and multiplier > 1.0:
-        message = f"{status} ({multiplier}x)"
+    message = f"{status} ({multiplier}x)" if status == "Active" and multiplier > 1.0 else status
 
     return jsonify({
         "schemaVersion": 1,
-        "label": label,
+        "label": f"RustChain {miner_id}",
         "message": message,
         "color": color,
     })
 
 
+
+
+@app.route('/api/miner_dashboard/<miner_id>', methods=['GET'])
+def api_miner_dashboard(miner_id):
+    """Aggregated miner dashboard data with reward history (last 20 epochs)."""
+    try:
+        with sqlite3.connect(DB_PATH) as c:
+            c.row_factory = sqlite3.Row
+            # current balance from balances table with column-name fallback
+            bal_rtc = 0.0
+            try:
+                row = c.execute("SELECT balance_urtc AS amount_i64 FROM balances WHERE wallet = ?", (miner_id,)).fetchone()
+                if row and row['amount_i64'] is not None:
+                    bal_rtc = (row['amount_i64'] / 1_000_000.0)
+            except Exception:
+                row = None
+
+            if bal_rtc == 0.0:
+                # production schema fallback: amount_i64 + miner_id
+                row2 = c.execute("SELECT amount_i64 FROM balances WHERE miner_id = ?", (miner_id,)).fetchone()
+                if row2 and row2['amount_i64'] is not None:
+                    bal_rtc = (row2['amount_i64'] / 1_000_000.0)
+
+            # total earned & reward history from confirmed pending_ledger credits
+            total_row = c.execute("SELECT COALESCE(SUM(amount_i64),0) AS s, COUNT(*) AS cnt FROM pending_ledger WHERE to_miner = ? AND status = 'confirmed'", (miner_id,)).fetchone()
+            total_earned = (total_row['s'] or 0) / 1_000_000.0
+            reward_events = int(total_row['cnt'] or 0)
+
+            hist = c.execute("""
+                SELECT epoch, amount_i64, tx_hash, confirmed_at
+                FROM pending_ledger
+                WHERE to_miner = ? AND status = 'confirmed'
+                ORDER BY epoch DESC, confirmed_at DESC
+                LIMIT 20
+            """, (miner_id,)).fetchall()
+            reward_history = [{
+                'epoch': int(r['epoch'] or 0),
+                'amount_rtc': round((r['amount_i64'] or 0)/1_000_000.0, 6),
+                'tx_hash': r['tx_hash'],
+                'confirmed_at': int(r['confirmed_at'] or 0),
+            } for r in hist]
+
+            # epoch participation count
+            ep_row = c.execute("SELECT COUNT(*) AS n FROM epoch_enroll WHERE miner_pk = ?", (miner_id,)).fetchone()
+            epoch_participation = int(ep_row['n'] or 0)
+
+            # last 24h attest timeline if table exists
+            has_hist = c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='miner_attest_history'").fetchone() is not None
+            timeline = []
+            if has_hist:
+                now_ts = int(time.time())
+                start = now_ts - 86400
+                rows = c.execute("""
+                    SELECT CAST((ts_ok/3600) AS INTEGER) AS bucket, COUNT(*) AS n
+                    FROM miner_attest_history
+                    WHERE miner = ? AND ts_ok >= ?
+                    GROUP BY bucket
+                    ORDER BY bucket ASC
+                """, (miner_id, start)).fetchall()
+                timeline = [{'hour_bucket': int(r['bucket']), 'count': int(r['n'])} for r in rows]
+
+            return jsonify({
+                'ok': True,
+                'miner_id': miner_id,
+                'balance_rtc': round(bal_rtc, 6),
+                'total_earned_rtc': round(total_earned, 6),
+                'reward_events': reward_events,
+                'epoch_participation': epoch_participation,
+                'reward_history': reward_history,
+                'attest_timeline_24h': timeline,
+                'generated_at': int(time.time()),
+            })
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
 @app.route("/api/miner/<miner_id>/attestations", methods=["GET"])
 def api_miner_attestations(miner_id: str):
     """Best-effort attestation history for a single miner (museum detail view)."""
-    limit, limit_err = _parse_int_query_arg("limit", 120, min_value=1, max_value=500)
-    if limit_err:
-        return jsonify({"ok": False, "error": limit_err}), 400
+    # SECURITY FIX 2026-02-15: Require admin key - exposes miner attestation history/timing
+    admin_key = request.headers.get("X-Admin-Key", "") or request.headers.get("X-API-Key", "")
+    if admin_key != os.environ.get("RC_ADMIN_KEY", "rustchain_admin_key_2025_secure64"):
+        return jsonify({"error": "Unauthorized - admin key required"}), 401
+    limit = int(request.args.get("limit", "120") or 120)
+    limit = max(1, min(limit, 500))
 
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
@@ -3385,9 +4535,12 @@ def api_miner_attestations(miner_id: str):
 @app.route("/api/balances", methods=["GET"])
 def api_balances():
     """Return wallet balances (best-effort across schema variants)."""
-    limit, limit_err = _parse_int_query_arg("limit", 2000, min_value=1, max_value=5000)
-    if limit_err:
-        return jsonify({"ok": False, "error": limit_err}), 400
+    # SECURITY FIX 2026-02-15: Require admin key - dumps all wallet balances
+    admin_key = request.headers.get("X-Admin-Key", "") or request.headers.get("X-API-Key", "")
+    if admin_key != os.environ.get("RC_ADMIN_KEY", "rustchain_admin_key_2025_secure64"):
+        return jsonify({"error": "Unauthorized - admin key required"}), 401
+    limit = int(request.args.get("limit", "2000") or 2000)
+    limit = max(1, min(limit, 5000))
 
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
@@ -3455,7 +4608,7 @@ def add_oui_deny():
     data = request.get_json()
 
     # Extract client IP (handle nginx proxy)
-    client_ip = client_ip_from_request(request)
+    client_ip = get_client_ip()
     oui = data.get('oui', '').lower().replace(':', '').replace('-', '')
     vendor = data.get('vendor', 'Unknown')
     enforce = int(data.get('enforce', 0))
@@ -3480,7 +4633,7 @@ def remove_oui_deny():
     data = request.get_json()
 
     # Extract client IP (handle nginx proxy)
-    client_ip = client_ip_from_request(request)
+    client_ip = get_client_ip()
     oui = data.get('oui', '').lower().replace(':', '').replace('-', '')
 
     with sqlite3.connect(DB_PATH) as conn:
@@ -3537,10 +4690,14 @@ def metrics_mac():
 @app.route('/ops/attest/debug', methods=['POST'])
 def attest_debug():
     """Debug endpoint: show miner's enrollment eligibility"""
+    # SECURITY FIX 2026-02-15: Require admin key - exposes internal config + MAC hashes
+    admin_key = request.headers.get("X-Admin-Key", "") or request.headers.get("X-API-Key", "")
+    if admin_key != os.environ.get("RC_ADMIN_KEY", "rustchain_admin_key_2025_secure64"):
+        return jsonify({"error": "Unauthorized - admin key required"}), 401
     data = request.get_json()
 
     # Extract client IP (handle nginx proxy)
-    client_ip = client_ip_from_request(request)
+    client_ip = get_client_ip()
     miner = data.get('miner') or data.get('miner_id')
 
     if not miner:
@@ -3650,6 +4807,9 @@ METRICS_SNAPSHOT = {}
 @app.route('/ops/readiness', methods=['GET'])
 def ops_readiness():
     """Single PASS/FAIL aggregator for all go/no-go checks"""
+    # SECURITY FIX 2026-02-15: Only show detailed checks to admin
+    admin_key = request.headers.get("X-Admin-Key", "") or request.headers.get("X-API-Key", "")
+    is_admin = admin_key == os.environ.get("RC_ADMIN_KEY", "rustchain_admin_key_2025_secure64")
     out = {"ok": True, "checks": []}
 
     # Health check
@@ -3704,6 +4864,9 @@ def ops_readiness():
         out["checks"].append({"name": "metrics_keys", "ok": False, "err": "unavailable"})
         out["ok"] = False
 
+    # Strip detailed checks for non-admin requests
+    if not is_admin:
+        return jsonify({"ok": out["ok"]}), (200 if out["ok"] else 503)
     return jsonify(out), (200 if out["ok"] else 503)
 
 @app.route('/health', methods=['GET'])
@@ -3777,12 +4940,20 @@ def api_rewards_epoch(epoch: int):
 @app.route('/wallet/balance', methods=['GET'])
 def api_wallet_balance():
     """Get balance for a specific miner"""
-    if not is_admin(request):
-        return jsonify({"ok": False, "reason": "admin_required"}), 401
-
     miner_id = request.args.get("miner_id", "").strip()
+    address = request.args.get("address", "").strip()
+
+    if miner_id and address and miner_id != address:
+        return jsonify({
+            "ok": False,
+            "error": "miner_id and address must match when both are provided",
+        }), 400
+
     if not miner_id:
-        return jsonify({"ok": False, "error": "miner_id required"}), 400
+        miner_id = address
+
+    if not miner_id:
+        return jsonify({"ok": False, "error": "miner_id or address required"}), 400
 
     with sqlite3.connect(DB_PATH) as db:
         row = db.execute("SELECT amount_i64 FROM balances WHERE miner_id=?", (miner_id,)).fetchone()
@@ -3793,6 +4964,104 @@ def api_wallet_balance():
         "amount_i64": amt,
         "amount_rtc": amt / UNIT
     })
+
+
+@app.route('/wallet/history', methods=['GET'])
+def api_wallet_history():
+    """Get public transfer history for a specific wallet."""
+    miner_id = request.args.get("miner_id", "").strip()
+    address = request.args.get("address", "").strip()
+
+    if miner_id and address and miner_id != address:
+        return jsonify({
+            "ok": False,
+            "error": "miner_id and address must match when both are provided",
+        }), 400
+
+    if not miner_id:
+        miner_id = address
+
+    if not miner_id:
+        return jsonify({"ok": False, "error": "miner_id or address required"}), 400
+
+    limit_raw = request.args.get("limit", "50").strip()
+    try:
+        limit = int(limit_raw or "50")
+    except ValueError:
+        return jsonify({"ok": False, "error": "limit must be an integer"}), 400
+
+    limit = max(1, min(limit, 200))
+
+    with sqlite3.connect(DB_PATH) as db:
+        rows = db.execute(
+            """
+            SELECT id, ts, from_miner, to_miner, amount_i64, reason, status,
+                   created_at, confirms_at, confirmed_at, tx_hash, voided_reason
+            FROM pending_ledger
+            WHERE from_miner = ? OR to_miner = ?
+            ORDER BY COALESCE(created_at, ts) DESC, id DESC
+            LIMIT ?
+            """,
+            (miner_id, miner_id, limit),
+        ).fetchall()
+
+    items = []
+    for row in rows:
+        (
+            pending_id,
+            ts,
+            from_miner,
+            to_miner,
+            amount_i64,
+            reason,
+            raw_status,
+            created_at,
+            confirms_at,
+            confirmed_at,
+            tx_hash,
+            voided_reason,
+        ) = row
+
+        direction = "sent" if from_miner == miner_id else "received"
+        counterparty = to_miner if direction == "sent" else from_miner
+
+        public_status = "confirmed"
+        if raw_status == "pending":
+            public_status = "pending"
+        elif raw_status != "confirmed":
+            public_status = "failed"
+
+        memo = None
+        if isinstance(reason, str) and reason.startswith("signed_transfer:"):
+            memo = reason.split(":", 1)[1] or None
+
+        tx_id = tx_hash or f"pending_{pending_id}"
+        created_ts = int(created_at or ts or 0)
+
+        items.append({
+            "id": int(pending_id),
+            "tx_id": tx_id,
+            "tx_hash": tx_id,
+            "from_addr": from_miner,
+            "to_addr": to_miner,
+            "amount": int(amount_i64) / UNIT,
+            "amount_i64": int(amount_i64),
+            "amount_rtc": int(amount_i64) / UNIT,
+            "timestamp": created_ts,
+            "created_at": created_ts,
+            "confirmed_at": int(confirmed_at) if confirmed_at else None,
+            "confirms_at": int(confirms_at) if confirms_at else None,
+            "status": public_status,
+            "raw_status": raw_status,
+            "status_reason": voided_reason,
+            "confirmations": 1 if raw_status == "confirmed" else 0,
+            "direction": direction,
+            "counterparty": counterparty,
+            "reason": reason,
+            "memo": memo,
+        })
+
+    return jsonify(items)
 
 # =============================================================================
 # 2-PHASE COMMIT PENDING LEDGER SYSTEM
@@ -3945,9 +5214,7 @@ def list_pending():
         return jsonify({"error": "Unauthorized"}), 401
 
     status_filter = request.args.get('status', 'pending')
-    limit, limit_err = _parse_int_query_arg("limit", 100, min_value=1, max_value=500)
-    if limit_err:
-        return jsonify({"ok": False, "error": limit_err}), 400
+    limit = min(int(request.args.get('limit', 100)), 500)
     
     with sqlite3.connect(DB_PATH) as db:
         if status_filter == 'all':
@@ -4211,7 +5478,7 @@ def wallet_transfer_OLD():
     data = request.get_json()
 
     # Extract client IP (handle nginx proxy)
-    client_ip = client_ip_from_request(request)
+    client_ip = get_client_ip()
     from_miner = data.get('from_miner')
     to_miner = data.get('to_miner')
     amount_rtc = float(data.get('amount_rtc', 0))
@@ -4479,6 +5746,92 @@ def address_from_pubkey(public_key_hex: str) -> str:
     pubkey_hash = hashlib.sha256(bytes.fromhex(public_key_hex)).hexdigest()[:40]
     return f"RTC{pubkey_hash}"
 
+def _ensure_governance_tables(c: sqlite3.Cursor) -> None:
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS governance_proposals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            proposer_wallet TEXT NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            activated_at INTEGER,
+            ends_at INTEGER,
+            status TEXT NOT NULL DEFAULT 'draft',
+            yes_weight REAL NOT NULL DEFAULT 0,
+            no_weight REAL NOT NULL DEFAULT 0
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS governance_votes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            proposal_id INTEGER NOT NULL,
+            voter_wallet TEXT NOT NULL,
+            vote TEXT NOT NULL,
+            weight REAL NOT NULL,
+            multiplier REAL NOT NULL,
+            base_balance_rtc REAL NOT NULL,
+            signature TEXT NOT NULL,
+            public_key TEXT NOT NULL,
+            nonce TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            UNIQUE(proposal_id, voter_wallet),
+            FOREIGN KEY (proposal_id) REFERENCES governance_proposals(id)
+        )
+    """)
+
+
+def _get_active_miner_antiquity_multiplier(c: sqlite3.Cursor, wallet: str):
+    row = c.execute(
+        """
+        SELECT ts_ok, device_family, device_arch
+        FROM miner_attest_recent
+        WHERE miner = ?
+        """,
+        (wallet,),
+    ).fetchone()
+    if not row or not row[0]:
+        return False, 0.0, "miner_not_attested"
+
+    age = int(time.time()) - int(row[0])
+    if age > GOVERNANCE_ACTIVE_MINER_WINDOW_SECONDS:
+        return False, 0.0, "miner_not_active"
+
+    family = row[1] or "unknown"
+    arch = row[2] or "unknown"
+    multiplier = HARDWARE_WEIGHTS.get(family, {}).get(
+        arch,
+        HARDWARE_WEIGHTS.get(family, {}).get("default", 1.0),
+    )
+    return True, float(multiplier), "ok"
+
+
+def _refresh_proposal_status(c: sqlite3.Cursor, proposal_row: sqlite3.Row):
+    now = int(time.time())
+    status = (proposal_row["status"] or "draft").lower()
+    ends_at = proposal_row["ends_at"]
+
+    if status == "draft":
+        activated_at = now
+        ends_at = now + GOVERNANCE_ACTIVE_SECONDS
+        c.execute(
+            "UPDATE governance_proposals SET status='active', activated_at=?, ends_at=? WHERE id=?",
+            (activated_at, ends_at, proposal_row["id"]),
+        )
+        status = "active"
+
+    if status == "active" and ends_at and now >= int(ends_at):
+        yes_weight = float(proposal_row["yes_weight"] or 0.0)
+        no_weight = float(proposal_row["no_weight"] or 0.0)
+        final_status = "passed" if yes_weight > no_weight else "failed"
+        c.execute(
+            "UPDATE governance_proposals SET status=? WHERE id=?",
+            (final_status, proposal_row["id"]),
+        )
+        status = final_status
+
+    return status
+
+
 def _balance_i64_for_wallet(c: sqlite3.Cursor, wallet_id: str) -> int:
     """
     Return wallet balance in micro-units (i64), tolerant to historical schema.
@@ -4507,6 +5860,114 @@ def _balance_i64_for_wallet(c: sqlite3.Cursor, wallet_id: str) -> int:
     return 0
 
 
+
+# ---------------------------------------------------------------------------
+# Beacon (bcn_) Wallet Address Support
+# ---------------------------------------------------------------------------
+# Beacon agents can use their beacon ID (bcn_xxx) as an RTC wallet address.
+# - Receiving: Anyone can send TO a bcn_ address
+# - Spending: Requires Ed25519 signature verified against the pubkey
+#   registered in the Beacon Atlas
+# - Resolution: bcn_ ID -> pubkey_hex from relay_agents table
+# ---------------------------------------------------------------------------
+
+BEACON_ATLAS_DB = "/root/beacon/beacon_atlas.db"
+
+
+def resolve_bcn_wallet(bcn_id: str) -> dict:
+    """
+    Resolve a bcn_ beacon ID to its registered public key and metadata.
+    
+    Returns dict with:
+      - found: bool
+      - agent_id: str
+      - pubkey_hex: str (Ed25519 public key)
+      - name: str
+      - rtc_address: str (derived RTC address from pubkey)
+    Or:
+      - found: False, error: str
+    """
+    if not bcn_id or not bcn_id.startswith("bcn_"):
+        return {"found": False, "error": "not_a_beacon_id"}
+    
+    try:
+        conn = sqlite3.connect(BEACON_ATLAS_DB)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT agent_id, pubkey_hex, name, status FROM relay_agents WHERE agent_id = ?",
+            (bcn_id,)
+        ).fetchone()
+        conn.close()
+        
+        if not row:
+            return {"found": False, "error": "beacon_id_not_registered"}
+        
+        if row["status"] != "active":
+            return {"found": False, "error": f"beacon_agent_status:{row[status]}"}
+        
+        pubkey_hex = row["pubkey_hex"]
+        rtc_addr = address_from_pubkey(pubkey_hex)
+        
+        return {
+            "found": True,
+            "agent_id": row["agent_id"],
+            "pubkey_hex": pubkey_hex,
+            "name": row["name"],
+            "rtc_address": rtc_addr,
+            "status": row["status"]
+        }
+    except Exception as e:
+        return {"found": False, "error": f"atlas_lookup_failed:{e}"}
+
+
+def is_bcn_address(addr: str) -> bool:
+    """Check if a wallet address is a beacon ID."""
+    return bool(addr and addr.startswith("bcn_") and len(addr) >= 8)
+
+
+@app.route("/wallet/resolve", methods=["GET"])
+def wallet_resolve():
+    """
+    Resolve a bcn_ beacon ID to its RTC wallet address and public key.
+    
+    This lets anyone look up the cryptographic identity behind a beacon wallet.
+    The pubkey is needed to verify signed transfers FROM this address.
+    
+    Query params:
+      - address: The bcn_ beacon ID to resolve
+    
+    Returns:
+      - agent_id, pubkey_hex, rtc_address, name
+    """
+    address = request.args.get("address", "").strip()
+    if not address:
+        return jsonify({"ok": False, "error": "address parameter required"}), 400
+    
+    if not is_bcn_address(address):
+        return jsonify({
+            "ok": False,
+            "error": "not_a_beacon_address",
+            "hint": "Only bcn_ prefixed addresses can be resolved. Regular wallet IDs are used directly."
+        }), 400
+    
+    result = resolve_bcn_wallet(address)
+    if not result["found"]:
+        return jsonify({
+            "ok": False,
+            "error": result["error"],
+            "hint": "Register your agent with the Beacon Atlas first: beacon atlas register"
+        }), 404
+    
+    return jsonify({
+        "ok": True,
+        "beacon_id": result["agent_id"],
+        "pubkey_hex": result["pubkey_hex"],
+        "rtc_address": result["rtc_address"],
+        "name": result["name"],
+        "status": result["status"]
+    })
+
+
 @app.route("/wallet/transfer/signed", methods=["POST"])
 def wallet_transfer_signed():
     """
@@ -4527,24 +5988,50 @@ def wallet_transfer_signed():
         return jsonify({"error": pre.error, "details": pre.details}), 400
 
     # Extract client IP (handle nginx proxy)
-    client_ip = client_ip_from_request(request)
+    client_ip = get_client_ip()
     
     from_address = pre.details["from_address"]
     to_address = pre.details["to_address"]
     nonce_int = pre.details["nonce"]
+    chain_id = pre.details.get("chain_id")
     signature = str(data.get("signature", "")).strip()
     public_key = str(data.get("public_key", "")).strip()
     memo = str(data.get("memo", ""))
     amount_rtc = pre.details["amount_rtc"]
 
-    # Verify public key matches from_address
-    expected_address = address_from_pubkey(public_key)
-    if from_address != expected_address:
+    if chain_id and chain_id != CHAIN_ID:
         return jsonify({
-            "error": "Public key does not match from_address",
-            "expected": expected_address,
-            "got": from_address
+            "error": "chain_id does not match active network",
+            "expected_chain_id": CHAIN_ID,
+            "got_chain_id": chain_id,
         }), 400
+
+    # Verify public key matches from_address
+    # Support bcn_ beacon addresses: resolve pubkey from Beacon Atlas
+    if is_bcn_address(from_address):
+        bcn_info = resolve_bcn_wallet(from_address)
+        if not bcn_info["found"]:
+            return jsonify({
+                "error": f"Beacon ID not registered in Atlas: {bcn_info.get('error', 'unknown')}",
+                "hint": "Register your agent first: beacon atlas register"
+            }), 404
+        # Use the Atlas pubkey — client may omit public_key for bcn_ wallets
+        atlas_pubkey = bcn_info["pubkey_hex"]
+        if public_key and public_key != atlas_pubkey:
+            return jsonify({
+                "error": "Public key does not match Beacon Atlas registration",
+                "beacon_id": from_address,
+                "expected_pubkey_prefix": atlas_pubkey[:16] + "..."
+            }), 400
+        public_key = atlas_pubkey  # Use Atlas pubkey for verification
+    else:
+        expected_address = address_from_pubkey(public_key)
+        if from_address != expected_address:
+            return jsonify({
+                "error": "Public key does not match from_address",
+                "expected": expected_address,
+                "got": from_address
+            }), 400
     
     nonce = str(nonce_int)
 
@@ -4556,6 +6043,8 @@ def wallet_transfer_signed():
         "memo": memo,
         "nonce": nonce
     }
+    if chain_id:
+        tx_data["chain_id"] = chain_id
     message = json.dumps(tx_data, sort_keys=True, separators=(",", ":")).encode()
     
     # Verify Ed25519 signature
@@ -4638,6 +6127,7 @@ def wallet_transfer_signed():
             "from_address": from_address,
             "to_address": to_address,
             "amount_rtc": amount_rtc,
+            "chain_id": chain_id or CHAIN_ID,
             "confirms_at": confirms_at,
             "confirms_in_hours": CONFIRMATION_DELAY_SECONDS / 3600,
             "message": f"Transfer pending. Will confirm in {CONFIRMATION_DELAY_SECONDS // 3600} hours unless voided."
@@ -4645,17 +6135,69 @@ def wallet_transfer_signed():
     finally:
         conn.close()
 
-if __name__ == "__main__":
-    try:
-        enforce_mock_signature_runtime_guard()
-    except RuntimeError as e:
-        print("=" * 70, file=sys.stderr)
-        print("FATAL: unsafe mock-signature configuration", file=sys.stderr)
-        print("=" * 70, file=sys.stderr)
-        print(str(e), file=sys.stderr)
-        print("=" * 70, file=sys.stderr)
-        sys.exit(1)
 
+# ---------------------------------------------------------------------------
+# Beacon Protocol Endpoints (OpenClaw envelope anchoring)
+# ---------------------------------------------------------------------------
+
+BEACON_RATE_WINDOW = 60
+BEACON_RATE_LIMIT  = 60
+
+@app.route("/beacon/submit", methods=["POST"])
+def beacon_submit():
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"ok": False, "error": "invalid_json"}), 400
+    agent_id = data.get("agent_id", "")
+    kind = data.get("kind", "")
+    nonce = data.get("nonce", "")
+    sig = data.get("sig", "")
+    pubkey = data.get("pubkey", "")
+    if not all([agent_id, kind, nonce, sig, pubkey]):
+        return jsonify({"ok": False, "error": "missing_fields"}), 400
+    if kind not in VALID_KINDS:
+        return jsonify({"ok": False, "error": f"invalid_kind:{kind}"}), 400
+    if len(nonce) < 6 or len(nonce) > 64:
+        return jsonify({"ok": False, "error": "nonce_length_invalid"}), 400
+    if len(sig) < 64 or len(sig) > 256:
+        return jsonify({"ok": False, "error": "sig_length_invalid"}), 400
+    if len(agent_id) < 5 or len(agent_id) > 64:
+        return jsonify({"ok": False, "error": "agent_id_length_invalid"}), 400
+    now = int(time.time())
+    cutoff = now - BEACON_RATE_WINDOW
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM beacon_envelopes WHERE agent_id = ? AND created_at >= ?",
+                (agent_id, cutoff)).fetchone()[0]
+            if count >= BEACON_RATE_LIMIT:
+                return jsonify({"ok": False, "error": "rate_limited"}), 429
+    except Exception:
+        pass
+    result = store_envelope(data, DB_PATH)
+    if result["ok"]:
+        return jsonify(result), 201
+    elif "duplicate_nonce" in result.get("error", ""):
+        return jsonify(result), 409
+    else:
+        return jsonify(result), 400
+
+@app.route("/beacon/digest", methods=["GET"])
+def beacon_digest():
+    d = compute_beacon_digest(DB_PATH)
+    return jsonify({"ok": True, "digest": d["digest"], "count": d["count"], "latest_ts": d["latest_ts"]})
+
+@app.route("/beacon/envelopes", methods=["GET"])
+def beacon_envelopes_list():
+    try:
+        limit = min(int(request.args.get("limit", 50)), 50)
+        offset = max(int(request.args.get("offset", 0)), 0)
+    except (ValueError, TypeError):
+        limit, offset = 50, 0
+    envelopes = get_recent_envelopes(limit=limit, offset=offset, db_path=DB_PATH)
+    return jsonify({"ok": True, "count": len(envelopes), "envelopes": envelopes})
+
+if __name__ == "__main__":
     # CRITICAL: SR25519 library is REQUIRED for production
     if not SR25519_AVAILABLE:
         print("=" * 70, file=sys.stderr)
@@ -4681,24 +6223,6 @@ if __name__ == "__main__":
         print(f"[P2P] Not available: {e}")
     except Exception as e:
         print(f"[P2P] Init failed: {e}")
-
-    # New: GPU Render Protocol (Bounty #30)
-    try:
-        from node.gpu_render_endpoints import register_gpu_render_endpoints
-        register_gpu_render_endpoints(app, DB_PATH, ADMIN_KEY)
-    except ImportError as e:
-        print(f"[GPU] Endpoint module not available: {e}")
-    except Exception as e:
-        print(f"[GPU] Endpoint init failed: {e}")
-
-    # Node Sync Protocol (Bounty #36) - decoupled from P2P init
-    try:
-        from node.rustchain_sync_endpoints import register_sync_endpoints
-        register_sync_endpoints(app, DB_PATH, ADMIN_KEY)
-    except ImportError as e:
-        print(f"[Sync] Not available: {e}")
-    except Exception as e:
-        print(f"[Sync] Init failed: {e}")
     print("=" * 70)
     print("RustChain v2.2.1 - SECURITY HARDENED - Mainnet Candidate")
     print("=" * 70)
@@ -4764,7 +6288,7 @@ echo.
 echo Downloading diagnostic test...
 echo.
 
-powershell -Command "Invoke-WebRequest -Uri 'http://50.28.86.131:8088/download/test' -OutFile 'test_miner_minimal.py'"
+powershell -Command "Invoke-WebRequest -Uri 'https://50.28.86.131/download/test' -OutFile 'test_miner_minimal.py'"
 if errorlevel 1 (
   echo [error] download failed
   exit /b 1

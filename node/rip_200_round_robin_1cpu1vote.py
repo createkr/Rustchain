@@ -59,6 +59,35 @@ ANTIQUITY_MULTIPLIERS = {
     "mips_r10000": 2.4,
     "mips_r12000": 2.3,
     
+    # ===========================================
+    # RETRO GAME CONSOLES (1983-2001) - 2.3x to 2.8x
+    # RIP-304: Pico serial-to-controller bridge
+    # ===========================================
+
+    # Nintendo
+    "nes_6502": 2.8,          # NES/Famicom - Ricoh 2A03 (6502 derivative, 1983)
+    "snes_65c816": 2.7,       # SNES/Super Famicom - Ricoh 5A22 (65C816, 1990)
+    "n64_mips": 2.5,          # Nintendo 64 - NEC VR4300 (MIPS R4300i, 1996)
+    "gba_arm7": 2.3,          # Game Boy Advance - ARM7TDMI (2001)
+
+    # Sega
+    "genesis_68000": 2.5,     # Sega Genesis/Mega Drive - Motorola 68000 (1988)
+    "sms_z80": 2.6,           # Sega Master System - Zilog Z80 (1986)
+    "saturn_sh2": 2.6,        # Sega Saturn - Hitachi SH-2 dual (1994)
+
+    # Nintendo Handheld
+    "gameboy_z80": 2.6,       # Game Boy - Sharp LR35902 (Z80 derivative, 1989)
+    "gameboy_color_z80": 2.5, # Game Boy Color - Sharp LR35902 @ 8MHz (1998)
+
+    # Sony
+    "ps1_mips": 2.8,          # PlayStation 1 - MIPS R3000A (1994)
+
+    # Generic CPU families used across consoles and computers
+    "6502": 2.8,              # MOS 6502 (Apple II, Commodore 64, NES, Atari)
+    "65c816": 2.7,            # WDC 65C816 (SNES, Apple IIGS)
+    "z80": 2.6,               # Zilog Z80 (Game Boy, SMS, MSX, Spectrum)
+    "sh2": 2.6,               # Hitachi SH-2 (Sega Saturn, 32X)
+
     # Sun SPARC (1987)
     "sparc_v7": 2.9,
     "sparc_v8": 2.7,
@@ -422,7 +451,20 @@ def calculate_epoch_rewards_time_aged(
             print(f"[REWARD] {miner_id[:20]}... fingerprint=FAIL -> weight=0")
         else:
             weight = get_time_aged_multiplier(device_arch, chain_age_years)
-        
+
+        # Apply Warthog dual-mining bonus (1.0x/1.1x/1.15x)
+        # Double-gated: fingerprint must pass (weight>0) AND fingerprint_ok==1
+        if weight > 0 and fingerprint_ok == 1:
+            try:
+                wart_row = cursor.execute(
+                    "SELECT warthog_bonus FROM miner_attest_recent WHERE miner=?",
+                    (miner_id,)
+                ).fetchone()
+                if wart_row and wart_row[0] and wart_row[0] > 1.0:
+                    weight *= wart_row[0]
+            except Exception:
+                pass  # Column may not exist on older schemas
+
         weighted_miners.append((miner_id, weight))
         total_weight += weight
 

@@ -1,11 +1,11 @@
 # RustChain Protocol Specification v1.1 (RIP-200)
 
 ## 1. Overview
-**RustChain** is a Proof-of-Antiquity blockchain designed to validate and reward real vintage hardware. Unlike traditional Proof-of-Work, RustChain does not use hash-based mining. Instead, it utilizes **RIP-200 (RustChain Iterative Protocol)**, a Proof-of-Attestation consensus mechanism where miners prove they are running on specific physical hardware (e.g., PowerPC G4, G5, SPARC) to earn **RTC** tokens.
+**RustChain** is a Proof-of-Antiquity blockchain designed to validate and reward real vintage hardware. Unlike traditional Proof-of-Work, RustChain does not use hash-based mining. Instead, it utilizes **RIP-200 (RustChain Iterative Protocol)**, a Proof-of-Antiquity consensus mechanism where miners prove they are running on specific physical hardware (e.g., PowerPC G4, G5, SPARC) to earn **RTC** tokens.
 
 Despite the name, the reference implementation is written in **Python** (Flask + SQLite), chosen for its ubiquity on vintage *nix platforms.
 
-## 2. Consensus: RIP-200 (Proof-of-Attestation)
+## 2. Consensus: RIP-200 (Proof-of-Antiquity)
 RIP-200 replaces hash power with hardware identity. The core principle is **1 CPU = 1 Vote**, weighted by the antiquity of the hardware.
 
 ### 2.1 The Attestation Cycle
@@ -50,7 +50,7 @@ Older hardware is weighted heavier to incentivize preservation.
 ## 5. Network Architecture
 ### 5.1 Nodes
 The network relies on trusted **Attestation Nodes** to validate fingerprints.
-*   **Primary Node**: `https://50.28.86.131`
+*   **Primary Node**: `https://rustchain.org`
 *   **Ergo Anchor Node**: `https://50.28.86.153`
 
 ### 5.2 Ergo Anchoring
