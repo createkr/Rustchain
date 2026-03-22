@@ -46,3 +46,9 @@ jobs:
         RC_ADMIN_KEY: "0123456789abcdef0123456789abcdef"
         DB_PATH: ":memory:"
       run: pytest tests/ -v
+
+    - name: Formal verification - Epoch settlement logic
+      env:
+        RC_ADMIN_KEY: "0123456789abcdef0123456789abcdef"
+        DB_PATH: ":memory:"
+      run: python tests/test_epoch_settlement_formal.py
