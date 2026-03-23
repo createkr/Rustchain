@@ -59,6 +59,79 @@ ANTIQUITY_MULTIPLIERS = {
     "mips_r10000": 2.4,
     "mips_r12000": 2.3,
     
+    # ===========================================
+    # RETRO GAME CONSOLES (1983-2001) - 2.3x to 2.8x
+    # RIP-304: Pico serial-to-controller bridge
+    # ===========================================
+
+    # Nintendo
+    "nes_6502": 2.8,          # NES/Famicom - Ricoh 2A03 (6502 derivative, 1983)
+    "snes_65c816": 2.7,       # SNES/Super Famicom - Ricoh 5A22 (65C816, 1990)
+    "n64_mips": 2.5,          # Nintendo 64 - NEC VR4300 (MIPS R4300i, 1996)
+    "gba_arm7": 2.3,          # Game Boy Advance - ARM7TDMI (2001)
+
+    # Sega
+    "genesis_68000": 2.5,     # Sega Genesis/Mega Drive - Motorola 68000 (1988)
+    "sms_z80": 2.6,           # Sega Master System - Zilog Z80 (1986)
+    "saturn_sh2": 2.6,        # Sega Saturn - Hitachi SH-2 dual (1994)
+
+    # Nintendo Handheld
+    "gameboy_z80": 2.6,       # Game Boy - Sharp LR35902 (Z80 derivative, 1989)
+    "gameboy_color_z80": 2.5, # Game Boy Color - Sharp LR35902 @ 8MHz (1998)
+
+    # Sony
+    "ps1_mips": 2.8,          # PlayStation 1 - MIPS R3000A (1994)
+
+    # Generic CPU families used across consoles and computers
+    "6502": 2.8,              # MOS 6502 (Apple II, Commodore 64, NES, Atari)
+    "65c02": 2.7,             # WDC 65C02 (Apple IIe enhanced, BBC Master)
+    "65c816": 2.7,            # WDC 65C816 (SNES, Apple IIGS)
+    "z80": 2.6,               # Zilog Z80 (Game Boy, SMS, MSX, Spectrum)
+    "sh1": 2.7,               # Hitachi SH-1 (1992) - early embedded
+    "sh2": 2.6,               # Hitachi SH-2 (Sega Saturn, 32X)
+    "sh4": 2.3,               # Hitachi SH-4 (Dreamcast, 1998) - 200MHz superscalar
+    "sh4a": 2.2,              # Renesas SH-4A (2003)
+
+    # ===========================================
+    # GAME CONSOLE CPUs — specific silicon (2000-2006)
+    # ===========================================
+
+    "dreamcast_sh4": 2.3,     # Sega Dreamcast - Hitachi SH-4 @ 200MHz (1998)
+    "ps2_ee": 2.2,            # PS2 Emotion Engine - Custom MIPS R5900 + VU0/VU1 (2000)
+    "emotion_engine": 2.2,    # PS2 alias
+    "gamecube_gekko": 2.1,    # GameCube - IBM Gekko (PowerPC 750CXe, 2001)
+    "xbox_celeron": 1.8,      # Xbox OG - Custom Pentium III / Celeron (2001)
+    "psp_allegrex": 2.0,      # PSP - Allegrex (MIPS R4000, 2004)
+    "xbox360_xenon": 2.0,     # Xbox 360 - Xenon tri-core PowerPC (2005)
+    "xenon": 2.0,             # Xbox 360 alias
+    "ps3_cell": 2.2,          # PS3 - Cell Broadband Engine (PPE + 7 SPE, 2006)
+    "cell_be": 2.2,           # Cell BE alias — legendary parallel arch
+    "wii_broadway": 2.0,      # Wii - IBM Broadway (PowerPC 750CL, 2006)
+    "nds_arm7_arm9": 2.3,     # Nintendo DS - ARM7TDMI + ARM946E dual (2004)
+
+    # ===========================================
+    # EXOTIC/DEAD ARCHITECTURES — unicorn tier
+    # ===========================================
+
+    "itanium": 2.5,           # Intel IA-64 Itanium (2001) — dead arch, extremely rare
+    "itanium2": 2.3,          # Itanium 2 / Montecito / Poulson
+    "ia64": 2.5,              # IA-64 alias
+    "vax": 3.5,               # DEC VAX (1977) — minicomputer legend, if you have one...
+    "vax_780": 3.5,           # VAX-11/780 — the original MIPS benchmark machine
+    "transputer": 3.5,        # Inmos Transputer (1984) — parallel computing pioneer
+    "t800": 3.5,              # Transputer T800 (with FPU)
+    "t414": 3.5,              # Transputer T414
+    "i860": 3.0,              # Intel i860 (1989) — failed "Cray on a chip"
+    "i960": 3.0,              # Intel i960 (1988) — embedded RISC, military/aerospace
+    "clipper": 3.5,           # Fairchild Clipper (1986) — workstation RISC, ultra-rare
+    "ns32k": 3.5,             # National Semiconductor NS32032 (1984) — failed x86 killer
+    "88k": 3.0,               # Motorola 88000 (1988) — killed by PowerPC alliance
+    "mc88100": 3.0,           # 88100 alias
+    "am29k": 3.0,             # AMD 29000 (1987) — AMD's RISC attempt, laser printers
+    "romp": 3.5,              # IBM ROMP (1986) — first commercial RISC, RT PC
+    "s390": 2.5,              # IBM System/390 mainframe
+    "s390x": 2.3,             # 64-bit z/Architecture
+
     # Sun SPARC (1987)
     "sparc_v7": 2.9,
     "sparc_v8": 2.7,
@@ -67,6 +140,11 @@ ANTIQUITY_MULTIPLIERS = {
     "ultrasparc_t1": 1.9,
     "ultrasparc_t2": 1.8,
     
+    # RISC-V (2010+) — open ISA, exotic but modern
+    "riscv": 1.4,             # Generic RISC-V boards (SiFive, StarFive, etc.)
+    "riscv64": 1.4,
+    "riscv32": 1.5,           # 32-bit even rarer
+
     # DEC Alpha (1992) - Fastest 1990s CPU
     "alpha_21064": 2.7,
     "alpha_21164": 2.5,
@@ -213,15 +291,36 @@ ANTIQUITY_MULTIPLIERS = {
     "m4": 1.05,
     
     # ===========================================
+    # VINTAGE ARM (1987-2005) — LEGENDARY/ANCIENT
+    # These are museum pieces, not NAS boxes
+    # ===========================================
+
+    "arm2": 4.0,              # Acorn Archimedes (1987) - MYTHIC
+    "arm3": 3.8,              # ARM3 with cache (1989)
+    "arm6": 3.5,              # ARM610, first for RiscPC (1992)
+    "arm7": 3.0,              # ARM7 (1994)
+    "arm7tdmi": 3.0,          # ARM7TDMI - GBA, tons of embedded (1995)
+    "strongarm": 2.8,         # DEC/Intel StrongARM SA-110 (1996)
+    "sa1100": 2.7,            # StrongARM SA-1100 - iPAQ era (1998)
+    "sa1110": 2.7,            # StrongARM SA-1110 (1999)
+    "xscale": 2.5,            # Intel XScale - PDAs, Zaurus (2000)
+    "arm9": 2.5,              # ARM9 (1998)
+    "arm926ej": 2.3,          # ARM926EJ-S (2001)
+    "arm11": 2.0,             # ARM11 - original iPhone, RPi 1 (2003)
+    "arm1176": 2.0,           # ARM1176JZF-S - Raspberry Pi 1 (2003)
+    "cortex_a8": 1.8,         # Cortex-A8 - BeagleBoard, iPhone 3GS (2005)
+    "cortex_a9": 1.5,         # Cortex-A9 - Tegra 2, OMAP4 (2007)
+
+    # ===========================================
     # DEFAULTS
     # ===========================================
-    
+
     "retro": 1.4,
     "modern": 0.8,
     "x86_64": 0.8,
-    "aarch64": 0.0005,
-    "arm": 0.0005,
-    "armv7": 0.0005,
+    "aarch64": 0.0005,        # Modern ARM — NAS/SBC spam penalty
+    "arm": 0.0005,            # Generic modern ARM
+    "armv7": 0.0005,          # Modern ARMv7
     "armv7l": 0.0005,
     "default": 0.8,
     "unknown": 0.8
@@ -422,7 +521,20 @@ def calculate_epoch_rewards_time_aged(
             print(f"[REWARD] {miner_id[:20]}... fingerprint=FAIL -> weight=0")
         else:
             weight = get_time_aged_multiplier(device_arch, chain_age_years)
-        
+
+        # Apply Warthog dual-mining bonus (1.0x/1.1x/1.15x)
+        # Double-gated: fingerprint must pass (weight>0) AND fingerprint_ok==1
+        if weight > 0 and fingerprint_ok == 1:
+            try:
+                wart_row = cursor.execute(
+                    "SELECT warthog_bonus FROM miner_attest_recent WHERE miner=?",
+                    (miner_id,)
+                ).fetchone()
+                if wart_row and wart_row[0] and wart_row[0] > 1.0:
+                    weight *= wart_row[0]
+            except Exception:
+                pass  # Column may not exist on older schemas
+
         weighted_miners.append((miner_id, weight))
         total_weight += weight
 

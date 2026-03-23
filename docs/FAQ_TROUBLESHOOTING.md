@@ -14,7 +14,7 @@ This guide covers common setup and runtime issues for miners and node users.
 ### 2) How do I check if the network is online?
 
 ```bash
-curl -sk https://50.28.86.131/health | jq .
+curl -sk https://rustchain.org/health | jq .
 ```
 
 You should see a JSON response. If the command times out repeatedly, check local firewall/VPN and retry.
@@ -22,7 +22,7 @@ You should see a JSON response. If the command times out repeatedly, check local
 ### 3) How do I verify my miner is visible?
 
 ```bash
-curl -sk https://50.28.86.131/api/miners | jq .
+curl -sk https://rustchain.org/api/miners | jq .
 ```
 
 If your miner is missing, wait a few minutes after startup and re-check logs.
@@ -30,7 +30,7 @@ If your miner is missing, wait a few minutes after startup and re-check logs.
 ### 4) How do I check wallet balance?
 
 ```bash
-curl -sk "https://50.28.86.131/wallet/balance?miner_id=YOUR_WALLET_NAME" | jq .
+curl -sk "https://rustchain.org/wallet/balance?miner_id=YOUR_WALLET_NAME" | jq .
 ```
 
 ### 5) Is self-signed TLS expected on the node API?
@@ -38,7 +38,7 @@ curl -sk "https://50.28.86.131/wallet/balance?miner_id=YOUR_WALLET_NAME" | jq .
 Yes. Existing docs use `-k`/`--insecure` for this reason:
 
 ```bash
-curl -sk https://50.28.86.131/health
+curl -sk https://rustchain.org/health
 ```
 
 ## Troubleshooting
@@ -68,9 +68,9 @@ Checks:
 
 Commands:
 ```bash
-curl -sk https://50.28.86.131/health | jq .
-curl -sk https://50.28.86.131/api/miners | jq .
-curl -sk "https://50.28.86.131/wallet/balance?miner_id=YOUR_WALLET_NAME" | jq .
+curl -sk https://rustchain.org/health | jq .
+curl -sk https://rustchain.org/api/miners | jq .
+curl -sk "https://rustchain.org/wallet/balance?miner_id=YOUR_WALLET_NAME" | jq .
 ```
 
 ### API calls fail with SSL/certificate errors
@@ -78,8 +78,19 @@ curl -sk "https://50.28.86.131/wallet/balance?miner_id=YOUR_WALLET_NAME" | jq .
 Use `-k` as shown in official docs:
 
 ```bash
-curl -sk https://50.28.86.131/api/miners | jq .
+curl -sk https://rustchain.org/api/miners | jq .
 ```
+
+### `clawrtc wallet show` says "could not reach network"
+
+The public node is healthy if this succeeds:
+
+```bash
+curl -sk https://rustchain.org/health | jq .
+curl -sk "https://rustchain.org/wallet/balance?miner_id=YOUR_WALLET_NAME" | jq .
+```
+
+If those commands work but your local helper still says `could not reach network`, you are likely using an older `clawrtc` wallet helper that still points at the retired `bulbous-bouffant.metalseed.net` host. Current docs use `https://rustchain.org`, and current `clawrtc` releases also do not ship a generic `wallet show` subcommand.
 
 ### Bridge/swap confusion (RTC vs wRTC)
 

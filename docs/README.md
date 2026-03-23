@@ -6,6 +6,7 @@
 
 | Document | Description |
 |----------|-------------|
+| **[Developer Tutorial](./RUSTCHAIN_DEVELOPER_TUTORIAL.md)** | 🆕 Comprehensive guide: setup, mining, transactions, examples |
 | [Protocol Specification](./PROTOCOL.md) | Full RIP-200 consensus protocol |
 | [Mechanism Spec + Falsification Matrix](./MECHANISM_SPEC_AND_FALSIFICATION_MATRIX.md) | One-page claim-to-test map with break conditions |
 | [API Reference](./API.md) | All endpoints with curl examples |
@@ -17,25 +18,26 @@
 | [Reward Analytics Dashboard](./REWARD_ANALYTICS_DASHBOARD.md) | Charts and API for RTC reward transparency |
 | [Cross-Node Sync Validator](./CROSS_NODE_SYNC_VALIDATOR.md) | Multi-node consistency checks and discrepancy reports |
 | [Discord Leaderboard Bot](./DISCORD_LEADERBOARD_BOT.md) | Webhook bot setup and usage |
+| [Japanese Quickstart (日本語)](./ja/README.md) | Community-maintained Japanese quickstart guide |
 
 ## Live Network
 
-- **Primary Node**: `https://50.28.86.131`
-- **Explorer**: `https://50.28.86.131/explorer`
-- **Health Check**: `curl -sk https://50.28.86.131/health`
+- **Primary Node**: `https://rustchain.org`
+- **Explorer**: `https://rustchain.org/explorer`
+- **Health Check**: `curl -sk https://rustchain.org/health`
 - **Network Status Page**: `docs/network-status.html` (GitHub Pages-hostable status dashboard)
 
 ## Current Stats
 
 ```bash
 # Check node health
-curl -sk https://50.28.86.131/health | jq .
+curl -sk https://rustchain.org/health | jq .
 
 # List active miners
-curl -sk https://50.28.86.131/api/miners | jq .
+curl -sk https://rustchain.org/api/miners | jq .
 
 # Current epoch info
-curl -sk https://50.28.86.131/epoch | jq .
+curl -sk https://rustchain.org/epoch | jq .
 ```
 
 ## Architecture Overview

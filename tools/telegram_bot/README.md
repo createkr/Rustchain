@@ -1,39 +1,65 @@
 # RustChain Telegram Community Bot
 
-实现 `rustchain-bounties#249` 要求的社区机器人命令：
+Telegram bot for RustChain community — Bounty #249 (50 RTC + bonuses).
 
-- `/price`：wRTC 价格
-- `/miners`：活跃矿工数
-- `/epoch`：当前 epoch 信息
-- `/balance <wallet>`：钱包余额
-- `/health`：节点健康状态
+## Commands
 
-## 1) 安装依赖
+| Command | Description |
+|---------|-------------|
+| `/price` | wRTC price from Raydium via DexScreener |
+| `/miners` | Active miner list and count |
+| `/epoch` | Current epoch, slot, pot, enrolled miners |
+| `/balance <wallet>` | Check RTC balance for a wallet |
+| `/health` | Node health, version, uptime, DB status |
+| `/subscribe` | Enable mining & price alerts in this chat |
+| `/unsubscribe` | Disable alerts |
+
+## Bonus Features
+
+- **Mining alerts** — notifies subscribed chats when a new miner joins or an epoch settles
+- **Price alerts** — notifies when wRTC price moves >5% (configurable)
+- **Inline queries** — type `@YourBot price`, `miners`, or `epoch` in any chat
+
+## Setup
 
 ```bash
-cd tools/telegram_bot
-python3 -m venv .venv
-source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## 2) 配置环境变量
+1. Create a bot via [@BotFather](https://t.me/BotFather) and copy the token.
+2. Enable inline mode via BotFather (`/setinline`) for inline queries.
+3. Configure environment:
 
 ```bash
-export TELEGRAM_BOT_TOKEN="<your_bot_token>"
-export RUSTCHAIN_API_BASE="http://50.28.86.131"
-# 可选：请求超时（秒）
-export RUSTCHAIN_REQUEST_TIMEOUT="8"
+cp .env.example .env
+# Edit .env with your bot token
 ```
 
-## 3) 启动
+4. Run:
 
 ```bash
-python bot.py
+python telegram_bot.py
 ```
 
-## 说明
+## Environment Variables
 
-- 默认请求 `http://50.28.86.131`，可用 `RUSTCHAIN_API_BASE` 覆盖。
-- 各命令对返回 payload 做了宽松字段兼容（不同字段名也尽量解析）。
-- 发生请求错误时会直接回显错误，方便群组调试。
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TELEGRAM_BOT_TOKEN` | _(required)_ | Bot token from BotFather |
+| `RUSTCHAIN_API` | `https://rustchain.org` | RustChain node URL |
+| `PRICE_ALERT_INTERVAL` | `120` | Seconds between price checks |
+| `MINER_ALERT_INTERVAL` | `60` | Seconds between miner checks |
+| `PRICE_CHANGE_THRESHOLD` | `5.0` | % change to trigger price alert |
+
+## Docker
+
+```bash
+docker build -t rustchain-tg-bot .
+docker run --env-file .env rustchain-tg-bot
+```
+
+## Key Improvements
+
+- **Async HTTP** — uses `aiohttp` instead of blocking `requests` in async handlers
+- **Correct API fields** — uses `amount_rtc`, `ok`, `slot`, `enrolled_miners` per API docs
+- **All bonus features** — mining alerts, price alerts, inline queries
