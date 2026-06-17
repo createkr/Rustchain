@@ -1,0 +1,876 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RustChain Mining Simulator — Try Before You Mine</title>
+    <style>
+        :root {
+            --bg-primary: #0f0f0f;
+            --bg-secondary: #1a1a1a;
+            --bg-card: #212121;
+            --bg-hover: #2a2a2a;
+            --text-primary: #f1f1f1;
+            --text-secondary: #b3b3b3;
+            --text-muted: #9e9e9e;
+            --accent: #3ea6ff;
+            --accent-hover: #65b8ff;
+            --green: #2ba640;
+            --red: #ff4444;
+            --orange: #ff9800;
+            --purple: #9c27b0;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        header {
+            text-align: center;
+            padding: 40px 20px;
+            background: linear-gradient(135deg, var(--bg-secondary) 0%, var(--bg-primary) 100%);
+            border-bottom: 1px solid #333;
+        }
+
+        header h1 {
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+            background: linear-gradient(90deg, var(--accent), var(--green));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        header p {
+            color: var(--text-secondary);
+            font-size: 1.1rem;
+        }
+
+        .step-indicator {
+            display: flex;
+            justify-content: center;
+            gap: 10px;
+            margin: 30px 0;
+            flex-wrap: wrap;
+        }
+
+        .step {
+            padding: 10px 20px;
+            background: var(--bg-card);
+            border-radius: 20px;
+            font-size: 14px;
+            border: 2px solid transparent;
+            transition: all 0.3s;
+        }
+
+        .step.active {
+            border-color: var(--accent);
+            background: rgba(62, 166, 255, 0.1);
+        }
+
+        .step.completed {
+            border-color: var(--green);
+            background: rgba(43, 166, 64, 0.1);
+        }
+
+        .card {
+            background: var(--bg-card);
+            border-radius: 12px;
+            padding: 30px;
+            margin-bottom: 20px;
+            border: 1px solid #333;
+        }
+
+        .card h2 {
+            margin-bottom: 20px;
+            color: var(--accent);
+        }
+
+        .hardware-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin: 20px 0;
+        }
+
+        .hardware-card {
+            background: var(--bg-secondary);
+            border-radius: 10px;
+            padding: 20px;
+            cursor: pointer;
+            border: 2px solid transparent;
+            transition: all 0.3s;
+        }
+
+        .hardware-card:hover {
+            border-color: var(--accent);
+            transform: translateY(-2px);
+        }
+
+        .hardware-card.selected {
+            border-color: var(--green);
+            background: rgba(43, 166, 64, 0.1);
+        }
+
+        .hardware-card.vm {
+            opacity: 0.6;
+        }
+
+        .hardware-name {
+            font-size: 1.2rem;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+
+        .hardware-multiplier {
+            font-size: 2rem;
+            font-weight: bold;
+            color: var(--green);
+        }
+
+        .hardware-multiplier.low {
+            color: var(--red);
+        }
+
+        .hardware-desc {
+            color: var(--text-secondary);
+            font-size: 14px;
+            margin-top: 10px;
+        }
+
+        .simulation-panel {
+            background: var(--bg-secondary);
+            border-radius: 10px;
+            padding: 20px;
+            margin: 20px 0;
+        }
+
+        .simulation-step {
+            display: none;
+            animation: fadeIn 0.5s;
+        }
+
+        .simulation-step.active {
+            display: block;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 8px;
+            background: var(--bg-primary);
+            border-radius: 4px;
+            overflow: hidden;
+            margin: 20px 0;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--accent), var(--green));
+            transition: width 0.5s;
+        }
+
+        .log-output {
+            background: #000;
+            border-radius: 8px;
+            padding: 15px;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+            max-height: 300px;
+            overflow-y: auto;
+            color: var(--green);
+        }
+
+        .log-line {
+            margin: 5px 0;
+        }
+
+        .log-line.error {
+            color: var(--red);
+        }
+
+        .log-line.warning {
+            color: var(--orange);
+        }
+
+        .log-line.info {
+            color: var(--accent);
+        }
+
+        .btn {
+            padding: 12px 30px;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-weight: bold;
+        }
+
+        .btn-primary {
+            background: var(--accent);
+            color: #000;
+        }
+
+        .btn-primary:hover {
+            background: var(--accent-hover);
+        }
+
+        .btn-primary:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .btn-secondary {
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            border: 1px solid #333;
+        }
+
+        .results-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin: 20px 0;
+        }
+
+        .result-item {
+            background: var(--bg-secondary);
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+        }
+
+        .result-value {
+            font-size: 2rem;
+            font-weight: bold;
+            color: var(--green);
+        }
+
+        .result-label {
+            color: var(--text-secondary);
+            font-size: 14px;
+        }
+
+        .comparison-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+        }
+
+        .comparison-table th, .comparison-table td {
+            padding: 15px;
+            text-align: left;
+            border-bottom: 1px solid #333;
+        }
+
+        .comparison-table th {
+            color: var(--accent);
+        }
+
+        .comparison-table tr:hover {
+            background: var(--bg-secondary);
+        }
+
+        .cta-section {
+            text-align: center;
+            padding: 40px 20px;
+            background: linear-gradient(135deg, rgba(62, 166, 255, 0.1), rgba(43, 166, 64, 0.1));
+            border-radius: 12px;
+            margin-top: 30px;
+        }
+
+        .cta-section h3 {
+            font-size: 1.5rem;
+            margin-bottom: 20px;
+        }
+
+        .cta-section p {
+            color: var(--text-secondary);
+            margin-bottom: 20px;
+        }
+
+        .hidden {
+            display: none !important;
+        }
+
+        .fingerprint-animation {
+            display: flex;
+            justify-content: center;
+            gap: 10px;
+            margin: 20px 0;
+        }
+
+        .fingerprint-block {
+            width: 60px;
+            height: 60px;
+            background: var(--accent);
+            border-radius: 8px;
+            animation: pulse 1s infinite;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 24px;
+        }
+
+        .fingerprint-block:nth-child(2) { animation-delay: 0.2s; }
+        .fingerprint-block:nth-child(3) { animation-delay: 0.4s; }
+        .fingerprint-block:nth-child(4) { animation-delay: 0.6s; }
+
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.1); opacity: 0.7; }
+        }
+
+        footer {
+            text-align: center;
+            padding: 30px;
+            color: var(--text-muted);
+            border-top: 1px solid #333;
+            margin-top: 40px;
+        }
+
+        footer a {
+            color: var(--accent);
+            text-decoration: none;
+        }
+
+        @media (max-width: 768px) {
+            header h1 {
+                font-size: 1.8rem;
+            }
+            
+            .hardware-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .step-indicator {
+                flex-direction: column;
+                align-items: center;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>⛏️ RustChain Mining Simulator</h1>
+        <p>See how Proof of Antiquity mining works — no hardware required!</p>
+    </header>
+
+    <div class="container">
+        <div class="step-indicator">
+            <div class="step active" id="step1-indicator">1. Choose Hardware</div>
+            <div class="step" id="step2-indicator">2. Fingerprint Check</div>
+            <div class="step" id="step3-indicator">3. Attestation</div>
+            <div class="step" id="step4-indicator">4. Epoch Rewards</div>
+            <div class="step" id="step5-indicator">5. Results</div>
+        </div>
+
+        <!-- Step 1: Hardware Selection -->
+        <div class="card" id="step1">
+            <h2>🖥️ Step 1: Choose Your Virtual Hardware</h2>
+            <p style="color: var(--text-secondary); margin-bottom: 20px;">
+                Select the hardware you want to simulate. Older hardware earns MORE rewards — that's the magic of Proof of Antiquity!
+            </p>
+            
+            <div class="hardware-grid">
+                <div class="hardware-card" data-hardware="g4" data-multiplier="2.5">
+                    <div class="hardware-name">📱 PowerBook G4</div>
+                    <div class="hardware-multiplier">2.5x</div>
+                    <div class="hardware-desc">Vintage 2001-2005 PowerPC laptop. Maximum antiquity bonus!</div>
+                </div>
+                
+                <div class="hardware-card" data-hardware="g5" data-multiplier="2.0">
+                    <div class="hardware-name">🖥️ Power Mac G5</div>
+                    <div class="hardware-multiplier">2.0x</div>
+                    <div class="hardware-desc">PowerPC desktop from 2003-2006. High antiquity bonus.</div>
+                </div>
+                
+                <div class="hardware-card" data-hardware="modern" data-multiplier="1.0">
+                    <div class="hardware-name">💻 Modern x86 PC</div>
+                    <div class="hardware-multiplier">1.0x</div>
+                    <div class="hardware-desc">Standard modern computer. Base reward rate.</div>
+                </div>
+                
+                <div class="hardware-card vm" data-hardware="vm" data-multiplier="0.000000001">
+                    <div class="hardware-name">☁️ Virtual Machine</div>
+                    <div class="hardware-multiplier low">0.000000001x</div>
+                    <div class="hardware-desc">VMs are detected and penalized. Proof of Antiquity requires REAL hardware!</div>
+                </div>
+            </div>
+            
+            <div style="text-align: center; margin-top: 30px;">
+                <button class="btn btn-primary" id="startBtn" disabled onclick="startSimulation()">
+                    Start Simulation →
+                </button>
+            </div>
+        </div>
+
+        <!-- Step 2: Fingerprint Check -->
+        <div class="card hidden" id="step2">
+            <h2>🔍 Step 2: Hardware Fingerprint Check</h2>
+            <p style="color: var(--text-secondary); margin-bottom: 20px;">
+                RustChain uses cryptographic fingerprinting to verify your hardware is real and determine its antiquity.
+            </p>
+            
+            <div class="simulation-panel">
+                <div class="fingerprint-animation">
+                    <div class="fingerprint-block">🔒</div>
+                    <div class="fingerprint-block">⚙️</div>
+                    <div class="fingerprint-block">🖥️</div>
+                    <div class="fingerprint-block">✓</div>
+                </div>
+                
+                <div class="progress-bar">
+                    <div class="progress-fill" id="fingerprint-progress" style="width: 0%"></div>
+                </div>
+                
+                <div class="log-output" id="fingerprint-log"></div>
+            </div>
+        </div>
+
+        <!-- Step 3: Attestation -->
+        <div class="card hidden" id="step3">
+            <h2>📜 Step 3: Attestation Submission</h2>
+            <p style="color: var(--text-secondary); margin-bottom: 20px;">
+                Your hardware submits cryptographic proof to the network. This can't be forged!
+            </p>
+            
+            <div class="simulation-panel">
+                <div class="log-output" id="attestation-log"></div>
+            </div>
+        </div>
+
+        <!-- Step 4: Epoch Participation -->
+        <div class="card hidden" id="step4">
+            <h2>⏱️ Step 4: Epoch Participation</h2>
+            <p style="color: var(--text-secondary); margin-bottom: 20px;">
+                Join the network and participate in epoch rounds. Your antiquity bonus multiplies your rewards!
+            </p>
+            
+            <div class="simulation-panel">
+                <div class="log-output" id="epoch-log"></div>
+            </div>
+        </div>
+
+        <!-- Step 5: Results -->
+        <div class="card hidden" id="step5">
+            <h2>🎉 Step 5: Your Results</h2>
+            
+            <div class="results-grid" id="results-grid"></div>
+            
+            <h3 style="margin: 30px 0 20px;">📊 Hardware Comparison</h3>
+            <table class="comparison-table">
+                <thead>
+                    <tr>
+                        <th>Hardware</th>
+                        <th>Multiplier</th>
+                        <th>Est. Daily RTC</th>
+                        <th>Est. Monthly RTC</th>
+                    </tr>
+                </thead>
+                <tbody id="comparison-body"></tbody>
+            </table>
+            
+            <div class="cta-section">
+                <h3>🚀 Ready to Mine for Real?</h3>
+                <p>Download the RustChain miner and start earning with your actual hardware!</p>
+                <a href="https://rustchain.org/download" class="btn btn-primary" style="display: inline-block; text-decoration: none; margin-top: 10px;">
+                    Download Miner →
+                </a>
+            </div>
+        </div>
+    </div>
+
+    <!-- Bonus: Calculator Section -->
+    <div class="container">
+        <div class="card" id="calculator-section" style="border: 2px solid var(--accent);">
+            <h2>💰 Bonus: "How Much Will You Earn?" Calculator</h2>
+            <p style="color: var(--text-secondary); margin-bottom: 20px;">
+                Estimate your potential earnings based on your actual hardware!
+            </p>
+            
+            <div class="calculator-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 20px;">
+                <div>
+                    <label style="display: block; margin-bottom: 8px; color: var(--text-secondary);">Your Hardware Type</label>
+                    <select id="calc-hardware" style="width: 100%; padding: 12px; background: var(--bg-secondary); border: 1px solid #333; border-radius: 8px; color: var(--text-primary); font-size: 14px;">
+                        <option value="g4">PowerBook G4 (2.5x)</option>
+                        <option value="g5">Power Mac G5 (2.0x)</option>
+                        <option value="modern" selected>Modern x86 PC (1.0x)</option>
+                        <option value="vm">Virtual Machine (0.000000001x)</option>
+                    </select>
+                </div>
+                
+                <div>
+                    <label style="display: block; margin-bottom: 8px; color: var(--text-secondary);">Hours Per Day Mining</label>
+                    <input type="number" id="calc-hours" value="24" min="1" max="24" style="width: 100%; padding: 12px; background: var(--bg-secondary); border: 1px solid #333; border-radius: 8px; color: var(--text-primary); font-size: 14px;">
+                </div>
+                
+                <div>
+                    <label style="display: block; margin-bottom: 8px; color: var(--text-secondary);">Network Participation Rate</label>
+                    <select id="calc-participation" style="width: 100%; padding: 12px; background: var(--bg-secondary); border: 1px solid #333; border-radius: 8px; color: var(--text-primary); font-size: 14px;">
+                        <option value="1.0">100% - Full Time</option>
+                        <option value="0.75">75% - High</option>
+                        <option value="0.5" selected>50% - Average</option>
+                        <option value="0.25">25% - Part Time</option>
+                    </select>
+                </div>
+                
+                <div>
+                    <label style="display: block; margin-bottom: 8px; color: var(--text-secondary);">RTC Price (USD, for fun)</label>
+                    <input type="number" id="calc-price" value="0.01" min="0" step="0.001" style="width: 100%; padding: 12px; background: var(--bg-secondary); border: 1px solid #333; border-radius: 8px; color: var(--text-primary); font-size: 14px;">
+                </div>
+            </div>
+            
+            <button class="btn btn-primary" onclick="calculateEarnings()" style="margin-bottom: 20px;">
+                📊 Calculate My Earnings
+            </button>
+            
+            <div id="calc-results" class="hidden" style="background: var(--bg-secondary); border-radius: 10px; padding: 20px;">
+                <h3 style="margin-bottom: 15px; color: var(--green);">📈 Your Estimated Earnings</h3>
+                <div class="results-grid" id="calc-results-grid"></div>
+                <div id="calc-vm-warning" class="hidden" style="background: rgba(255, 68, 68, 0.1); border: 1px solid var(--red); border-radius: 8px; padding: 15px; margin-top: 15px; color: var(--red);">
+                    ⚠️ <strong>VM Warning:</strong> Virtual machines receive a massive penalty (0.000000001x) because RustChain's Proof of Antiquity requires genuine hardware fingerprints. VMs cannot generate valid antiquity proofs!
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <footer>
+        <p>
+            <a href="https://rustchain.org">RustChain</a> — 
+            Proof of Antiquity Mining | 
+            <a href="https://github.com/createkr/Rustchain">GitHub</a> |
+            <a href="https://discord.gg/VqVVS2CW9Q">Discord</a>
+        </p>
+        <p style="margin-top: 10px; font-size: 12px; color: var(--text-muted);">
+            Bounty #2301 • Wallet: 9dRRMiHiJwjF3VW8pXtKDtpmmxAPFy3zWgV2JY5H6eeT
+        </p>
+    </footer>
+
+    <script>
+        // Hardware data
+        const hardwareData = {
+            g4: {
+                name: 'PowerBook G4',
+                multiplier: 2.5,
+                type: 'PowerPC',
+                year: '2001-2005',
+                cpuCores: 1,
+                fingerprint: 'PPC_7457_GENUINE_VINTAGE'
+            },
+            g5: {
+                name: 'Power Mac G5',
+                multiplier: 2.0,
+                type: 'PowerPC',
+                year: '2003-2006',
+                cpuCores: 2,
+                fingerprint: 'PPC_970_GENUINE_VINTAGE'
+            },
+            modern: {
+                name: 'Modern x86 PC',
+                multiplier: 1.0,
+                type: 'x86_64',
+                year: '2020+',
+                cpuCores: 8,
+                fingerprint: 'X86_MODERN_STANDARD'
+            },
+            vm: {
+                name: 'Virtual Machine',
+                multiplier: 0.000000001,
+                type: 'Virtualized',
+                year: 'N/A',
+                cpuCores: 'Emulated',
+                fingerprint: 'VM_DETECTED_PENALIZED'
+            }
+        };
+
+        let selectedHardware = null;
+        let currentStep = 1;
+
+        // Hardware selection
+        document.querySelectorAll('.hardware-card').forEach(card => {
+            card.addEventListener('click', function() {
+                document.querySelectorAll('.hardware-card').forEach(c => c.classList.remove('selected'));
+                this.classList.add('selected');
+                selectedHardware = this.dataset.hardware;
+                document.getElementById('startBtn').disabled = false;
+            });
+        });
+
+        function log(element, message, type = '') {
+            const logEl = document.getElementById(element);
+            const line = document.createElement('div');
+            line.className = 'log-line ' + type;
+            line.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+            logEl.appendChild(line);
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+
+        async function startSimulation() {
+            if (!selectedHardware) return;
+            
+            document.getElementById('step1').classList.add('hidden');
+            document.getElementById('step2').classList.remove('hidden');
+            document.getElementById('step1-indicator').classList.add('completed');
+            document.getElementById('step2-indicator').classList.add('active');
+            
+            await runFingerprintCheck();
+        }
+
+        async function runFingerprintCheck() {
+            const hw = hardwareData[selectedHardware];
+            const progress = document.getElementById('fingerprint-progress');
+            
+            log('fingerprint-log', 'Starting hardware fingerprint analysis...', 'info');
+            await sleep(500);
+            
+            log('fingerprint-log', `Detecting CPU architecture: ${hw.type}`, '');
+            progress.style.width = '25%';
+            await sleep(400);
+            
+            log('fingerprint-log', `Hardware vintage: ${hw.year}`, '');
+            progress.style.width = '50%';
+            await sleep(400);
+            
+            log('fingerprint-log', `Generating cryptographic fingerprint...`, '');
+            progress.style.width = '75%';
+            await sleep(500);
+            
+            if (selectedHardware === 'vm') {
+                log('fingerprint-log', '⚠️ WARNING: Virtualization detected!', 'warning');
+                await sleep(300);
+                log('fingerprint-log', 'VM fingerprint: VM_DETECTED_PENALIZED', 'warning');
+                log('fingerprint-log', 'RustChain requires real hardware for fair distribution.', 'warning');
+            } else {
+                log('fingerprint-log', `Fingerprint: ${hw.fingerprint}`, 'info');
+            }
+            
+            progress.style.width = '100%';
+            await sleep(500);
+            log('fingerprint-log', '✅ Hardware verification complete!', '');
+            
+            await sleep(1000);
+            runAttestation();
+        }
+
+        async function runAttestation() {
+            document.getElementById('step2').classList.add('hidden');
+            document.getElementById('step3').classList.remove('hidden');
+            document.getElementById('step2-indicator').classList.add('completed');
+            document.getElementById('step3-indicator').classList.add('active');
+            
+            const hw = hardwareData[selectedHardware];
+            
+            log('attestation-log', 'Creating attestation payload...', 'info');
+            await sleep(500);
+            
+            const attestation = {
+                hardware_id: hw.fingerprint,
+                timestamp: new Date().toISOString(),
+                antiquity_score: hw.multiplier,
+                nonce: Math.random().toString(36).substring(7)
+            };
+            
+            log('attestation-log', `Payload: ${JSON.stringify(attestation, null, 2)}`, '');
+            await sleep(800);
+            
+            log('attestation-log', 'Signing attestation with hardware key...', '');
+            await sleep(600);
+            
+            log('attestation-log', 'Submitting to RustChain network...', 'info');
+            await sleep(700);
+            
+            if (selectedHardware === 'vm') {
+                log('attestation-log', '⚠️ Attestation accepted but with PENALTY multiplier', 'warning');
+            } else {
+                log('attestation-log', `✅ Attestation accepted! Antiquity bonus: ${hw.multiplier}x`, '');
+            }
+            
+            await sleep(1000);
+            runEpochParticipation();
+        }
+
+        async function runEpochParticipation() {
+            document.getElementById('step3').classList.add('hidden');
+            document.getElementById('step4').classList.remove('hidden');
+            document.getElementById('step3-indicator').classList.add('completed');
+            document.getElementById('step4-indicator').classList.add('active');
+            
+            const hw = hardwareData[selectedHardware];
+            const baseReward = 10;
+            const actualReward = baseReward * hw.multiplier;
+            
+            log('epoch-log', 'Joining epoch round #1847...', 'info');
+            await sleep(500);
+            
+            log('epoch-log', `Your antiquity multiplier: ${hw.multiplier}x`, '');
+            await sleep(400);
+            
+            log('epoch-log', 'Waiting for your turn in round-robin selection...', '');
+            await sleep(800);
+            
+            log('epoch-log', '🎲 Your turn! Participating in epoch...', 'info');
+            await sleep(500);
+            
+            log('epoch-log', 'Calculating reward...', '');
+            await sleep(600);
+            
+            log('epoch-log', `Base reward: ${baseReward} RTC`, '');
+            log('epoch-log', `Your reward: ${actualReward.toFixed(selectedHardware === 'vm' ? 10 : 2)} RTC (${hw.multiplier}x)`, 
+                selectedHardware === 'vm' ? 'warning' : '');
+            
+            await sleep(1000);
+            showResults();
+        }
+
+        function showResults() {
+            document.getElementById('step4').classList.add('hidden');
+            document.getElementById('step5').classList.remove('hidden');
+            document.getElementById('step4-indicator').classList.add('completed');
+            document.getElementById('step5-indicator').classList.add('active');
+            
+            const hw = hardwareData[selectedHardware];
+            const baseDaily = 100;
+            const actualDaily = baseDaily * hw.multiplier;
+            
+            // Results grid
+            document.getElementById('results-grid').innerHTML = `
+                <div class="result-item">
+                    <div class="result-value">${hw.name}</div>
+                    <div class="result-label">Selected Hardware</div>
+                </div>
+                <div class="result-item">
+                    <div class="result-value">${hw.multiplier}x</div>
+                    <div class="result-label">Antiquity Multiplier</div>
+                </div>
+                <div class="result-item">
+                    <div class="result-value">${actualDaily.toFixed(selectedHardware === 'vm' ? 10 : 2)} RTC</div>
+                    <div class="result-label">Est. Daily Reward</div>
+                </div>
+                <div class="result-item">
+                    <div class="result-value">${(actualDaily * 30).toFixed(selectedHardware === 'vm' ? 8 : 2)} RTC</div>
+                    <div class="result-label">Est. Monthly Reward</div>
+                </div>
+            `;
+            
+            // Comparison table
+            const baseMonthly = 3000;
+            document.getElementById('comparison-body').innerHTML = `
+                <tr style="background: rgba(43, 166, 64, 0.1);">
+                    <td><strong>${hw.name}</strong> (Your selection)</td>
+                    <td>${hw.multiplier}x</td>
+                    <td>${actualDaily.toFixed(selectedHardware === 'vm' ? 10 : 2)} RTC</td>
+                    <td>${(actualDaily * 30).toFixed(selectedHardware === 'vm' ? 8 : 2)} RTC</td>
+                </tr>
+                <tr>
+                    <td>PowerBook G4</td>
+                    <td>2.5x</td>
+                    <td>250 RTC</td>
+                    <td>7,500 RTC</td>
+                </tr>
+                <tr>
+                    <td>Power Mac G5</td>
+                    <td>2.0x</td>
+                    <td>200 RTC</td>
+                    <td>6,000 RTC</td>
+                </tr>
+                <tr>
+                    <td>Modern x86 PC</td>
+                    <td>1.0x</td>
+                    <td>100 RTC</td>
+                    <td>3,000 RTC</td>
+                </tr>
+                <tr style="opacity: 0.6;">
+                    <td>Virtual Machine</td>
+                    <td>0.000000001x</td>
+                    <td>~0 RTC</td>
+                    <td>~0 RTC</td>
+                </tr>
+            `;
+        }
+
+        function sleep(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+        }
+
+        // Bonus: Calculator Function
+        function calculateEarnings() {
+            const hardwareId = document.getElementById('calc-hardware').value;
+            const hoursPerDay = parseFloat(document.getElementById('calc-hours').value) || 24;
+            const participation = parseFloat(document.getElementById('calc-participation').value) || 0.5;
+            const rtcPrice = parseFloat(document.getElementById('calc-price').value) || 0.01;
+            
+            const hw = hardwareData[hardwareId];
+            const baseHourlyRate = 4.17; // ~100 RTC/day base rate / 24 hours
+            const hourlyRate = baseHourlyRate * hw.multiplier * participation;
+            const dailyRTC = hourlyRate * hoursPerDay;
+            const weeklyRTC = dailyRTC * 7;
+            const monthlyRTC = dailyRTC * 30;
+            const yearlyRTC = dailyRTC * 365;
+            
+            const isVM = hardwareId === 'vm';
+            
+            document.getElementById('calc-results').classList.remove('hidden');
+            
+            document.getElementById('calc-results-grid').innerHTML = `
+                <div class="result-item">
+                    <div class="result-value">${hw.name}</div>
+                    <div class="result-label">Hardware</div>
+                </div>
+                <div class="result-item">
+                    <div class="result-value">${hw.multiplier}x</div>
+                    <div class="result-label">Antiquity Multiplier</div>
+                </div>
+                <div class="result-item">
+                    <div class="result-value">${dailyRTC.toFixed(isVM ? 10 : 2)} RTC</div>
+                    <div class="result-label">Daily (${hoursPerDay}h @ ${participation*100}%)</div>
+                </div>
+                <div class="result-item">
+                    <div class="result-value">${weeklyRTC.toFixed(isVM ? 10 : 2)} RTC</div>
+                    <div class="result-label">Weekly</div>
+                </div>
+                <div class="result-item">
+                    <div class="result-value">${monthlyRTC.toFixed(isVM ? 8 : 2)} RTC</div>
+                    <div class="result-label">Monthly</div>
+                </div>
+                <div class="result-item">
+                    <div class="result-value">${yearlyRTC.toFixed(isVM ? 6 : 2)} RTC</div>
+                    <div class="result-label">Yearly</div>
+                </div>
+                <div class="result-item">
+                    <div class="result-value">$${(monthlyRTC * rtcPrice).toFixed(isVM ? 10 : 2)}</div>
+                    <div class="result-label">Monthly USD Value</div>
+                </div>
+                <div class="result-item">
+                    <div class="result-value">$${(yearlyRTC * rtcPrice).toFixed(isVM ? 8 : 2)}</div>
+                    <div class="result-label">Yearly USD Value</div>
+                </div>
+            `;
+            
+            // Show VM warning if applicable
+            const vmWarning = document.getElementById('calc-vm-warning');
+            if (isVM) {
+                vmWarning.classList.remove('hidden');
+            } else {
+                vmWarning.classList.add('hidden');
+            }
+        }
+    </script>
+</body>
+</html>
